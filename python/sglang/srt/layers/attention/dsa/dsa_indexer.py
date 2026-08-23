@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -780,6 +781,76 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             local_idxs.clamp_min_(0)
             logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
         return logits
+
+    # ------------------------------------------------------------------
+    # Indexer-as-a-service disaggregation (experimental, gated by
+    # SGLANG_INDEX_DISAG). Moves SCORE+SELECT (_get_topk_paged) to a
+    # dedicated indexer GPU: the model ranks send q_fp8 (+ weights + page
+    # table) to the indexer process and receive topk_result back over
+    # NVLink. See runs/20260823_033353_r3_indexer_service/ for the real
+    # multi-process PoC (batched comm = 1 round-trip/step) and the design
+    # in runs/20260822_021415_r2_disag_2gpu_design/.
+    # ------------------------------------------------------------------
+    def _get_indexer_disag_client(self):
+        """Lazily fetch the indexer-disag RPC client registered by the
+        indexer worker process. Returns None if none is registered (the
+        disag path is then inactive). The client is pluggable so this file
+        has no hard dependency on the transport."""
+        client = getattr(self, "_indexer_disag_client", None)
+        if client is not None:
+            return client
+        # Optional, lazily-imported registration hook (set by the indexer
+        # worker at startup). Kept off the hot path.
+        try:
+            from sglang.srt.layers.attention.dsa import indexer_disag  # type: ignore
+            client = indexer_disag.get_client()
+        except Exception:
+            client = None
+        self._indexer_disag_client = client
+        return client
+
+    def _disag_topk_remote(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        """Remote SCORE+SELECT on the indexer GPU.
+
+        Model side: send q_fp8 (+ weights + page table + seqlens) to the
+        indexer process, receive topk_result. Mirrors _get_topk_paged's return
+        (a (B*next_n, index_topk) int tensor). The indexer owns the full
+        index-key pool; the model ranks keep only the MLA device buffer + a
+        small topk device buffer.
+        """
+        client = self._get_indexer_disag_client()
+        if client is None:
+            raise RuntimeError(
+                "SGLANG_INDEX_DISAG=1 but no indexer-disag client is "
+                "registered. Start the indexer worker process that owns the "
+                "index-key pool and registers the RPC client (see "
+                "runs/20260823_033353_r3_indexer_service/).")
+        # The decode path calls deepgemm_paged_mqa_logits_split which does
+        # q.unsqueeze(1) -> (B*next_n, 1, n_heads, head_dim); ship that shape.
+        q_send = q_fp8.unsqueeze(1) if q_fp8.dim() == 3 else q_fp8
+        block_table = (
+            metadata.get_page_table_64()
+            if self.page_size == 64 else metadata.get_page_table_1()
+        )
+        seqlens = metadata.get_seqlens_int32()
+        topk_result = client.topk_remote(
+            layer_id=layer_id,
+            q_fp8=q_send,
+            weights=weights,
+            seqlens=seqlens,
+            block_table=block_table,
+            max_seq_len=block_table.shape[1] * self.page_size,
+            index_topk=self.index_topk,
+        )
+        topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+        return maybe_capture_indexer_topk(layer_id, topk_result)
 
     def _get_topk_paged(
         self,
@@ -1825,9 +1896,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
-                topk_result = self._get_topk_paged(
-                    forward_batch, layer_id, q_fp8, weights, metadata
-                )
+                if os.environ.get("SGLANG_INDEX_DISAG", "0") == "1":
+                    # indexer-as-a-service: SCORE+SELECT runs on a dedicated
+                    # indexer GPU; model ranks ship q_fp8 and recv topk.
+                    topk_result = self._disag_topk_remote(
+                        forward_batch, layer_id, q_fp8, weights, metadata
+                    )
+                else:
+                    topk_result = self._get_topk_paged(
+                        forward_batch, layer_id, q_fp8, weights, metadata
+                    )
             else:
                 if (
                     forward_batch.attn_cp_metadata is not None
