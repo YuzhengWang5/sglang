@@ -455,6 +455,33 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         return False
 
+    def _synthetic_decode_topk(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        device: torch.device,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Build deterministic legal logical indices without touching index cache.
+
+        HiSparse consumes logical token positions and performs the real host-KV
+        lookup/swap-in afterwards.  The odd affine stride makes all selections
+        unique for the power-of-two contexts in this benchmark.  Advancing the
+        decode position changes almost the whole set, so steady state exercises
+        real misses and H2D retrieval rather than only hot-buffer hits.
+        Zero-length DP-padding rows remain all ``-1``.
+        """
+        seq_lens = forward_batch.seq_lens.to(device=device, dtype=torch.int32)
+        safe_lens = seq_lens.clamp(min=1)
+        offsets = torch.arange(self.index_topk, dtype=torch.int32, device=device)
+        base = seq_lens * 8191 + int(layer_id) * 104729
+        result = torch.remainder(
+            base.unsqueeze(1) - offsets.unsqueeze(0) * 104729,
+            safe_lens.unsqueeze(1),
+        )
+        valid = offsets.unsqueeze(0) < seq_lens.unsqueeze(1)
+        return torch.where(valid, result, -1)
+
     def _get_q_k_bf16(
         self,
         q_lora: torch.Tensor,
@@ -1574,6 +1601,33 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
 
+        benchmark_mode = envs.SGLANG_DSA_BENCHMARK_MODE.get()
+        if benchmark_mode not in (
+            "normal",
+            "no_indexer_compute",
+            "oracle_no_index",
+        ):
+            raise ValueError(
+                "SGLANG_DSA_BENCHMARK_MODE must be normal, "
+                "no_indexer_compute, or oracle_no_index; got "
+                f"{benchmark_mode!r}"
+            )
+        if benchmark_mode != "normal":
+            if not forward_batch.forward_mode.is_decode_or_idle():
+                raise RuntimeError(
+                    f"{benchmark_mode} is decode-only and cannot run "
+                    f"forward mode {forward_batch.forward_mode}."
+                )
+            topk_result = (
+                self._synthetic_decode_topk(
+                    forward_batch, device=x_meta.device, layer_id=layer_id
+                )
+                if return_indices
+                else None
+            )
+            topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+            return maybe_capture_indexer_topk(layer_id, topk_result)
+
         in_piecewise_or_breakable_cuda_graph = (
             _is_in_piecewise_or_breakable_cuda_graph()
         )
@@ -1892,5 +1946,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
         else:
             raise NotImplementedError("DSA indexer only supports CUDA, HIP, and NPU")
+        if (
+            envs.SGLANG_DSA_BENCHMARK_FORCE_SYNTHETIC_OUTPUT.get()
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            # Dummy KV has no semantic index keys. Normal still executes every
+            # projection/store/score/select kernel above, while downstream sees
+            # the same retrieval pattern as both no-compute modes.
+            topk_result = self._synthetic_decode_topk(
+                forward_batch, device=x_meta.device, layer_id=layer_id
+            )
         topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
         return maybe_capture_indexer_topk(layer_id, topk_result)

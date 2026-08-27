@@ -4429,7 +4429,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
         else:
             assert self.page_size == 64
-        self.index_key_cache = self._create_index_key_cache()
+        self.index_key_cache = (
+            None
+            if envs.SGLANG_DSA_BENCHMARK_MODE.get() == "oracle_no_index"
+            else self._create_index_key_cache()
+        )
         self._finalize_allocation_log(size)
 
     def _create_index_key_cache(self) -> IndexKeyCache:
@@ -4438,19 +4442,29 @@ class DSATokenToKVPool(MLATokenToKVPool):
     @property
     def index_k_with_scale_buffer(self):
         # Preserve direct HiCache access while storage lives behind the facade.
-        return self.index_key_cache.buffer
+        return [] if self.index_key_cache is None else self.index_key_cache.buffer
 
     def _clear_buffers(self):
         super()._clear_buffers()
-        self.index_key_cache.clear()
+        if self.index_key_cache is not None:
+            self.index_key_cache.clear()
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
         super().move_kv_cache(tgt_loc, src_loc)
-        self.index_key_cache.move(tgt_loc, src_loc)
+        if self.index_key_cache is not None:
+            self.index_key_cache.move(tgt_loc, src_loc)
+
+    def _require_index_key_cache(self) -> IndexKeyCache:
+        if self.index_key_cache is None:
+            raise RuntimeError(
+                "Oracle-No-Index attempted to access indexer K/scale cache. "
+                "The benchmark mode must use synthetic top-k indices."
+            )
+        return self.index_key_cache
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
-        return self.index_key_cache.get_local_buffer(layer_id)
+        return self._require_index_key_cache().get_local_buffer(layer_id)
 
     def get_index_k_continuous(
         self,
@@ -4458,7 +4472,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
-        return self.index_key_cache.get_k_continuous(layer_id, seq_len, page_indices)
+        return self._require_index_key_cache().get_k_continuous(
+            layer_id, seq_len, page_indices
+        )
 
     def get_index_k_scale_continuous(
         self,
@@ -4466,7 +4482,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
-        return self.index_key_cache.get_k_scale_continuous(
+        return self._require_index_key_cache().get_k_scale_continuous(
             layer_id, seq_len, page_indices
         )
 
@@ -4478,7 +4494,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_len_sum: int,
         max_seq_len: int,
     ):
-        return self.index_key_cache.get_k_and_scale(
+        return self._require_index_key_cache().get_k_and_scale(
             layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
         )
 
@@ -4489,19 +4505,29 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        self.index_key_cache.store_quantized(layer_id, loc, index_k, index_k_scale)
+        self._require_index_key_cache().store_quantized(
+            layer_id, loc, index_k, index_k_scale
+        )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
-        return {"kv": kv_cache_cpu, "index_k": self.index_key_cache.cpu_copy(indices)}
+        index_k = (
+            None
+            if self.index_key_cache is None
+            else self.index_key_cache.cpu_copy(indices)
+        )
+        return {"kv": kv_cache_cpu, "index_k": index_k}
 
     def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
         super().load_cpu_copy(
             kv_cache_cpu_dict["kv"], indices, mamba_indices=mamba_indices
         )
-        self.index_key_cache.load_cpu_copy(kv_cache_cpu_dict["index_k"], indices)
+        if self.index_key_cache is not None:
+            self.index_key_cache.load_cpu_copy(kv_cache_cpu_dict["index_k"], indices)
 
     def get_state_buf_infos(self):
+        if self.index_key_cache is None:
+            return [], [], []
         return self.index_key_cache.state_buf_infos()
 
     def get_kv_size_bytes(self):

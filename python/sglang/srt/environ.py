@@ -451,6 +451,12 @@ class Envs:
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+    # Decode-only research controls.  These are intentionally environment-only
+    # instead of public server arguments: synthetic top-k indices do not preserve
+    # model accuracy and must never be enabled accidentally in serving.
+    SGLANG_DSA_BENCHMARK_MODE = EnvStr("normal")
+    SGLANG_DSA_BENCHMARK_FORCE_SYNTHETIC_OUTPUT = EnvBool(False)
+    SGLANG_DSA_DUMMY_KV_HOST_SIZE_GB = EnvFloat(0.0)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.

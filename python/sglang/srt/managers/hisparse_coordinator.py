@@ -168,7 +168,7 @@ class HiSparseCoordinator:
             self.mem_pool_host = MLATokenToKVPoolHost(
                 device_pool=self.mem_pool_device,
                 host_to_device_ratio=host_to_device_ratio,
-                host_size=0,
+                host_size=envs.SGLANG_DSA_DUMMY_KV_HOST_SIZE_GB.get(),
                 page_size=self.mem_pool_device.page_size,
                 layout="layer_first",
                 override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,

@@ -356,6 +356,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         num_layers: int,
         allocate_all_layers: bool = False,
     ) -> int:
+        if envs.SGLANG_DSA_BENCHMARK_MODE.get() == "oracle_no_index":
+            return 0
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         indexer_size_per_token = (
             index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
