@@ -4431,7 +4431,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
             assert self.page_size == 64
         self.index_key_cache = (
             None
-            if envs.SGLANG_DSA_BENCHMARK_MODE.get() == "oracle_no_index"
+            if envs.SGLANG_DSA_BENCHMARK_MODE.get()
+            in ("oracle_no_index", "oracle_recent", "iaas_fp4")
             else self._create_index_key_cache()
         )
         self._finalize_allocation_log(size)
@@ -4458,7 +4459,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def _require_index_key_cache(self) -> IndexKeyCache:
         if self.index_key_cache is None:
             raise RuntimeError(
-                "Oracle-No-Index attempted to access indexer K/scale cache. "
+                "Index-free oracle attempted to access indexer K/scale cache. "
                 "The benchmark mode must use synthetic top-k indices."
             )
         return self.index_key_cache

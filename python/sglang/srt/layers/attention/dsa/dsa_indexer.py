@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -482,6 +484,73 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         valid = offsets.unsqueeze(0) < seq_lens.unsqueeze(1)
         return torch.where(valid, result, -1)
 
+    def _synthetic_recent_decode_topk(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Select the newest ``index_topk`` tokens without reading index cache.
+
+        Unlike ``_synthetic_decode_topk``, which intentionally replaces almost
+        every selected token each step to stress HiSparse misses, this oracle
+        advances a sliding window by one token.  It therefore isolates the
+        indexer-free model path under the temporal locality expected from real
+        decode top-k: after warmup, only one newly selected token per request and
+        layer can miss the hot buffer.  It is a performance oracle only and has
+        no model-quality meaning.
+        """
+        seq_lens = forward_batch.seq_lens.to(device=device, dtype=torch.int32)
+        offsets = torch.arange(self.index_topk, dtype=torch.int32, device=device)
+        result = seq_lens.unsqueeze(1) - 1 - offsets.unsqueeze(0)
+        return torch.where(result >= 0, result, -1)
+
+    def _synthetic_overlap_decode_topk(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        device: torch.device,
+        layer_id: int,
+        overlap_fraction: float,
+    ) -> torch.Tensor:
+        """Create a graph-safe top-k trace with controlled adjacent overlap.
+
+        A fixed anchor set realizes the retained fraction.  The remaining
+        selections advance by one disjoint block per decode step, avoiding the
+        unrealistically fast recurrence of a two-window toggle.  This models
+        retrieval pressure from measured locality while the real indexer still
+        executes; it does not model semantic token identities.
+        """
+        seq_lens = forward_batch.seq_lens.to(device=device, dtype=torch.int64)
+        retain = int(round(self.index_topk * overlap_fraction))
+        churn = self.index_topk - retain
+        offsets = torch.arange(self.index_topk, dtype=torch.int64, device=device)
+        anchors = offsets.unsqueeze(0).expand(seq_lens.shape[0], -1)
+        if churn == 0:
+            return torch.where(
+                offsets.unsqueeze(0) < seq_lens.unsqueeze(1), anchors, -1
+            ).to(torch.int32)
+
+        churn_offsets = torch.arange(churn, dtype=torch.int64, device=device)
+        available = (seq_lens - retain).clamp(min=1)
+        rows = torch.arange(seq_lens.shape[0], dtype=torch.int64, device=device)
+        start = torch.remainder(
+            seq_lens * churn + int(layer_id) * 104729 + rows * 8191,
+            available,
+        )
+        churn_indices = retain + torch.remainder(
+            start.unsqueeze(1) + churn_offsets.unsqueeze(0),
+            available.unsqueeze(1),
+        )
+        result = anchors.clone()
+        result[:, retain:] = churn_indices
+        valid_rows = seq_lens >= self.index_topk
+        recent = self._synthetic_recent_decode_topk(
+            forward_batch, device=device
+        ).to(torch.int64)
+        result = torch.where(valid_rows.unsqueeze(1), result, recent)
+        return result.to(torch.int32)
+
     def _get_q_k_bf16(
         self,
         q_lora: torch.Tensor,
@@ -807,6 +876,189 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             local_idxs.clamp_min_(0)
             logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
         return logits
+
+    def _maybe_log_decode_locality(
+        self,
+        forward_batch: ForwardBatch,
+        topk_result: Optional[torch.Tensor],
+    ) -> None:
+        """Emit small real-trace locality records for an explicit quality run.
+
+        This diagnostic is deliberately eager-only: scalar extraction adds a
+        synchronization per sparse layer and must never contaminate performance
+        measurements or CUDA Graph capture.  It records only aggregate overlap,
+        not prompt text or the large top-k tensors themselves.
+        """
+        if os.environ.get("SGLANG_DSA_LOG_TOPK_LOCALITY") != "1":
+            return
+        if get_is_capture_mode() or not forward_batch.forward_mode.is_decode_or_idle():
+            return
+        if topk_result is None or topk_result.shape[0] != 1:
+            return
+
+        current = topk_result[0]
+        valid = current[current >= 0]
+        seq_len = int(forward_batch.seq_lens[0].item())
+        hot_tokens = int(os.environ.get("SGLANG_DSA_LOCALITY_HOT_TOKENS", "4096"))
+        hot_cutoff = max(0, seq_len - hot_tokens)
+        hot_fraction = (
+            float((valid >= hot_cutoff).float().mean().item())
+            if valid.numel()
+            else 0.0
+        )
+
+        previous = getattr(self, "_locality_previous_topk", None)
+        previous_seq_len = getattr(self, "_locality_previous_seq_len", None)
+        overlap_fraction = None
+        if (
+            previous is not None
+            and previous_seq_len is not None
+            and seq_len == previous_seq_len + 1
+            and valid.numel()
+        ):
+            overlap_fraction = float(torch.isin(valid, previous).float().mean().item())
+        self._locality_previous_topk = valid.detach().clone()
+        self._locality_previous_seq_len = seq_len
+
+        logger.info(
+            "IAAS_TOPK_LOCALITY %s",
+            json.dumps(
+                {
+                    "layer": self.layer_id,
+                    "seq_len": seq_len,
+                    "selected": int(valid.numel()),
+                    "adjacent_overlap_fraction": overlap_fraction,
+                    "hot_window_tokens": hot_tokens,
+                    "hot_window_fraction": hot_fraction,
+                },
+                separators=(",", ":"),
+            ),
+        )
+
+    def _maybe_store_fp4_shadow(
+        self,
+        *,
+        key: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        fp8_cache: torch.Tensor,
+        page_size: int,
+    ) -> None:
+        """Maintain a real-key FP4 cache for explicit eager quality diagnostics."""
+        if os.environ.get("SGLANG_DSA_FP4_SHADOW") != "1":
+            return
+        if get_is_capture_mode():
+            raise RuntimeError("SGLANG_DSA_FP4_SHADOW is eager-only")
+        if self.use_dsa_indexer_fusion:
+            raise RuntimeError(
+                "SGLANG_DSA_FP4_SHADOW requires "
+                "SGLANG_DISABLE_DSA_INDEXER_FUSION=1"
+            )
+        if page_size != 64 or fp8_cache.ndim != 2:
+            raise RuntimeError("FP4 shadow currently requires a page-64 CUDA cache")
+
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            _store_fp4_index_k_cache_kernel,
+            quantize_fp4_indexer_tensor,
+        )
+
+        cache = getattr(self, "_fp4_shadow_cache", None)
+        if cache is None:
+            cache = torch.zeros(
+                (fp8_cache.shape[0], page_size * 68),
+                dtype=torch.uint8,
+                device=key.device,
+            )
+            cache[:, page_size * 64 :].fill_(127)
+            self._fp4_shadow_cache = cache
+
+        k_data, k_scale = quantize_fp4_indexer_tensor(key.contiguous())
+        loc = out_cache_loc.contiguous()
+        _store_fp4_index_k_cache_kernel[(key.shape[0],)](
+            k_data.view(torch.uint8),
+            k_scale,
+            cache,
+            loc,
+            page_size,
+            cache.stride(0),
+            BLOCK=64,
+        )
+
+    def _maybe_compare_fp4_shadow(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        metadata: BaseIndexerMetadata,
+        query: Optional[torch.Tensor],
+        x_for_gate: Optional[torch.Tensor],
+        fp8_topk: Optional[torch.Tensor],
+    ) -> None:
+        """Compare FP4 and native FP8 top-k on the same real decode Q/K."""
+        if os.environ.get("SGLANG_DSA_FP4_SHADOW") != "1":
+            return
+        if get_is_capture_mode() or not forward_batch.forward_mode.is_decode_or_idle():
+            return
+        cache = getattr(self, "_fp4_shadow_cache", None)
+        if query is None or x_for_gate is None or fp8_topk is None or cache is None:
+            raise RuntimeError("FP4 shadow decode is missing Q, gate input, top-k, or cache")
+
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            quantize_fp4_indexer_tensor,
+        )
+
+        batch = query.shape[0]
+        q_data, q_scale = quantize_fp4_indexer_tensor(query.contiguous())
+        q_data = q_data.view(batch, 1, self.n_heads, self.head_dim // 2)
+        q_scale = q_scale.view(batch, 1, self.n_heads)
+        weights = self._weights_proj_bf16_in_fp32_out(x_for_gate)
+        weights = weights * (self.softmax_scale * self.n_heads**-0.5)
+
+        page_size = get_token_to_kv_pool().page_size
+        block_tables = metadata.get_page_table_64()
+        seqlens = metadata.get_seqlens_int32()
+        seqlens_2d = seqlens.unsqueeze(-1)
+        schedule = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        if schedule is None:
+            schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                seqlens_2d, page_size, self.sm_count
+            )
+        max_seq_len = block_tables.shape[1] * page_size
+        logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+            (q_data, q_scale),
+            cache.view(cache.shape[0], page_size, 1, 68),
+            weights,
+            seqlens_2d,
+            block_tables,
+            schedule,
+            max_seq_len,
+            False,
+        )
+        self._mask_init_and_local_tokens(logits, seqlens)
+        fp4_topk = metadata.topk_transform(logits, self.index_topk)
+
+        recalls = []
+        for row in range(fp8_topk.shape[0]):
+            reference = fp8_topk[row]
+            reference = reference[reference >= 0]
+            candidate = fp4_topk[row]
+            candidate = candidate[candidate >= 0]
+            recalls.append(
+                float(torch.isin(reference, candidate).float().mean().item())
+                if reference.numel()
+                else 1.0
+            )
+        logger.info(
+            "IAAS_FP4_RECALL %s",
+            json.dumps(
+                {
+                    "layer": self.layer_id,
+                    "seq_len": int(seqlens.max().item()),
+                    "batch": batch,
+                    "recall_mean": sum(recalls) / len(recalls),
+                    "recall_min": min(recalls),
+                },
+                separators=(",", ":"),
+            ),
+        )
 
     def _get_topk_paged(
         self,
@@ -1507,6 +1759,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
 
+        fp8_cache = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+        self._maybe_store_fp4_shadow(
+            key=key,
+            out_cache_loc=out_cache_loc,
+            fp8_cache=fp8_cache,
+            page_size=pool.page_size,
+        )
+
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
@@ -1517,7 +1777,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            buf = fp8_cache
             fused_store_index_k_cache(
                 key,
                 buf,
@@ -1533,7 +1793,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # because page_size is 1 there.
         if _use_aiter:
             page_size = pool.page_size
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            buf = fp8_cache
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
             if not out_loc.is_contiguous():
@@ -1600,31 +1860,109 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
+        shadow_query = None
+        shadow_x_for_gate = None
 
         benchmark_mode = envs.SGLANG_DSA_BENCHMARK_MODE.get()
         if benchmark_mode not in (
             "normal",
             "no_indexer_compute",
             "oracle_no_index",
+            "oracle_recent",
+            "iaas_fp4",
         ):
             raise ValueError(
                 "SGLANG_DSA_BENCHMARK_MODE must be normal, "
-                "no_indexer_compute, or oracle_no_index; got "
+                "no_indexer_compute, oracle_no_index, oracle_recent, or "
+                "iaas_fp4; got "
                 f"{benchmark_mode!r}"
             )
-        if benchmark_mode != "normal":
+        if benchmark_mode not in ("normal", "iaas_fp4"):
             if not forward_batch.forward_mode.is_decode_or_idle():
                 raise RuntimeError(
                     f"{benchmark_mode} is decode-only and cannot run "
                     f"forward mode {forward_batch.forward_mode}."
                 )
-            topk_result = (
-                self._synthetic_decode_topk(
+            if not return_indices:
+                topk_result = None
+            elif benchmark_mode == "oracle_recent":
+                topk_result = self._synthetic_recent_decode_topk(
+                    forward_batch, device=x_meta.device
+                )
+            else:
+                topk_result = self._synthetic_decode_topk(
                     forward_batch, device=x_meta.device, layer_id=layer_id
                 )
-                if return_indices
-                else None
+            topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+            return maybe_capture_indexer_topk(layer_id, topk_result)
+
+        if benchmark_mode == "iaas_fp4":
+            if not forward_batch.forward_mode.is_decode_or_idle():
+                raise RuntimeError(
+                    "iaas_fp4 currently supports decode/idle only, got "
+                    f"{forward_batch.forward_mode}"
+                )
+            # Model initialization runs eager decode-shaped dummy forwards for
+            # FlashInfer autotuning before DecodeCudaGraphRunner enters
+            # model_capture_mode. They must not consume the service's formal
+            # warmup/capture protocol. The benchmark runtime itself replays the
+            # captured graph, so eager IAAS execution is intentionally outside
+            # this experimental data plane.
+            if not get_is_capture_mode():
+                topk_result = (
+                    self._synthetic_recent_decode_topk(
+                        forward_batch, device=x_meta.device
+                    )
+                    if return_indices
+                    else None
+                )
+                topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+                return maybe_capture_indexer_topk(layer_id, topk_result)
+            # The decode runner also captures a dense select-all graph for short
+            # sequences. It must not consume a service graph phase.
+            if self._should_skip_logits_computation(forward_batch):
+                topk_result = (
+                    self._synthetic_recent_decode_topk(
+                        forward_batch, device=x_meta.device
+                    )
+                    if return_indices
+                    else None
+                )
+            else:
+                query, key, weights_raw = self._get_q_k_bf16(
+                    q_lora,
+                    x,
+                    positions,
+                    enable_dual_stream=False,
+                    forward_batch=forward_batch,
+                )
+                weight_scale = self.softmax_scale * self.n_heads**-0.5
+                if self.use_dsa_indexer_fusion:
+                    assert weights_raw is not None
+                    weights = weights_raw.float() * weight_scale
+                else:
+                    weights = self._weights_proj_bf16_in_fp32_out(x) * weight_scale
+                from sglang.srt.layers.attention.dsa.iaas_indexer_service import (
+                    get_iaas_client,
+                )
+
+                topk_result = get_iaas_client().query(
+                    query=query,
+                    key=key,
+                    weights=weights,
+                )
+                if not return_indices:
+                    topk_result = None
+            overlap_fraction = float(
+                os.environ.get("SGLANG_DSA_BENCHMARK_OVERLAP_FRACTION", "-1")
             )
+            if topk_result is not None and overlap_fraction >= 0:
+                topk_result = self._synthetic_overlap_decode_topk(
+                    forward_batch,
+                    device=x_meta.device,
+                    layer_id=layer_id,
+                    overlap_fraction=overlap_fraction,
+                )
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
@@ -1737,6 +2075,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
+            shadow_query = query
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             with torch.cuda.stream(self.alt_stream):
                 self._store_index_k_cache(
@@ -1758,6 +2097,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 enable_dual_stream,
                 forward_batch=forward_batch,
             )
+            shadow_query = query
 
             if enable_dual_stream:
                 current_stream = torch.cuda.current_stream()
@@ -1827,6 +2167,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     x_for_gate = x_q.to(torch.bfloat16)
             else:
                 x_for_gate = x
+            shadow_x_for_gate = x_for_gate
 
             if in_piecewise_or_breakable_cuda_graph:
                 if self.use_dsa_indexer_fusion:
@@ -1946,6 +2287,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
         else:
             raise NotImplementedError("DSA indexer only supports CUDA, HIP, and NPU")
+        if os.environ.get("SGLANG_DSA_FP4_SHADOW") == "1":
+            assert metadata is not None
+            self._maybe_compare_fp4_shadow(
+                forward_batch=forward_batch,
+                metadata=metadata,
+                query=shadow_query,
+                x_for_gate=shadow_x_for_gate,
+                fp8_topk=topk_result,
+            )
         if (
             envs.SGLANG_DSA_BENCHMARK_FORCE_SYNTHETIC_OUTPUT.get()
             and forward_batch.forward_mode.is_decode_or_idle()
@@ -1956,5 +2306,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result = self._synthetic_decode_topk(
                 forward_batch, device=x_meta.device, layer_id=layer_id
             )
+        overlap_fraction = float(
+            os.environ.get("SGLANG_DSA_BENCHMARK_OVERLAP_FRACTION", "-1")
+        )
+        if (
+            topk_result is not None
+            and overlap_fraction >= 0
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            # Preserve the real colocated indexer work while giving the model
+            # side the same locality-controlled retrieval trace as IAAS.
+            topk_result = self._synthetic_overlap_decode_topk(
+                forward_batch,
+                device=x_meta.device,
+                layer_id=layer_id,
+                overlap_fraction=overlap_fraction,
+            )
+        self._maybe_log_decode_locality(forward_batch, topk_result)
         topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
         return maybe_capture_indexer_topk(layer_id, topk_result)

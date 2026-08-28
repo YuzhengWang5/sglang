@@ -47,7 +47,13 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import kill_process_tree, maybe_reindex_device_id
 
 
-MODES = ("normal", "no_indexer_compute", "oracle_no_index")
+MODES = (
+    "normal",
+    "no_indexer_compute",
+    "oracle_no_index",
+    "oracle_recent",
+    "iaas_fp4",
+)
 
 
 @dataclasses.dataclass
@@ -64,6 +70,12 @@ class DummyDecodeArgs:
     dummy_host_size_gb: float = 0.2
     result_filename: str = "decode_dummy.jsonl"
     force_synthetic_retrieval: bool = True
+    synthetic_overlap_fraction: float = -1.0
+    iaas_host: str = "127.0.0.1"
+    iaas_port: int = 29649
+    iaas_service_gpu_id: int = 4
+    iaas_service_device: str = ""
+    iaas_service_result_filename: str = "iaas_service.json"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -80,6 +92,26 @@ class DummyDecodeArgs:
         parser.add_argument("--decode-steps", type=int, default=20)
         parser.add_argument("--dummy-host-size-gb", type=float, default=0.2)
         parser.add_argument("--result-filename", default="decode_dummy.jsonl")
+        parser.add_argument(
+            "--synthetic-overlap-fraction",
+            type=float,
+            default=-1.0,
+            help=(
+                "If in [0,1], preserve this fraction of a deterministic top-k "
+                "between adjacent steps after running the configured indexer."
+            ),
+        )
+        parser.add_argument("--iaas-host", default="127.0.0.1")
+        parser.add_argument("--iaas-port", type=int, default=29649)
+        parser.add_argument("--iaas-service-gpu-id", type=int, default=4)
+        parser.add_argument(
+            "--iaas-service-device",
+            default="",
+            help="Optional CUDA_VISIBLE_DEVICES value for the service child.",
+        )
+        parser.add_argument(
+            "--iaas-service-result-filename", default="iaas_service.json"
+        )
         parser.add_argument(
             "--no-force-synthetic-retrieval",
             action="store_false",
@@ -125,7 +157,11 @@ def _configure_cli_for_point(
     padded_hot = bench_args.device_buffer_size + page_size
     device_tokens = _ceil_to(bench_args.batch_size * padded_hot, page_size)
     aligned_context = _ceil_to(bench_args.context_len, page_size)
-    private_index_pages = bench_args.indexer_mode != "oracle_no_index"
+    private_index_pages = bench_args.indexer_mode not in (
+        "oracle_no_index",
+        "oracle_recent",
+        "iaas_fp4",
+    )
     logical_tokens = aligned_context * (
         bench_args.batch_size if private_index_pages else 1
     )
@@ -157,6 +193,11 @@ def _configure_cli_for_point(
     os.environ["SGLANG_DSA_BENCHMARK_MODE"] = bench_args.indexer_mode
     os.environ["SGLANG_DSA_BENCHMARK_FORCE_SYNTHETIC_OUTPUT"] = (
         "1" if bench_args.force_synthetic_retrieval else "0"
+    )
+    if not (-1.0 <= bench_args.synthetic_overlap_fraction <= 1.0):
+        raise ValueError("--synthetic-overlap-fraction must be -1 or in [0, 1]")
+    os.environ["SGLANG_DSA_BENCHMARK_OVERLAP_FRACTION"] = str(
+        bench_args.synthetic_overlap_fraction
     )
     os.environ["SGLANG_DSA_DUMMY_KV_HOST_SIZE_GB"] = str(
         bench_args.dummy_host_size_gb
@@ -237,7 +278,11 @@ def _prepare_dummy_state(model_runner, bench_args: DummyDecodeArgs):
     page_size = allocator.page_size
     aligned_context = _ceil_to(bench_args.context_len, page_size)
     logical_allocator = allocator.logical_attn_allocator
-    private_pages = bench_args.indexer_mode != "oracle_no_index"
+    private_pages = bench_args.indexer_mode not in (
+        "oracle_no_index",
+        "oracle_recent",
+        "iaas_fp4",
+    )
     alloc_tokens = aligned_context * (bench_args.batch_size if private_pages else 1)
     logical = logical_allocator.alloc(alloc_tokens)
     if logical is None:
@@ -409,7 +454,8 @@ def _memory_breakdown(
         "allocation_batch_size": bench_args.batch_size,
         "active_logical_tokens": (
             bench_args.context_len
-            if bench_args.indexer_mode == "oracle_no_index"
+            if bench_args.indexer_mode
+            in ("oracle_no_index", "oracle_recent", "iaas_fp4")
             else actual_batch_size * bench_args.context_len
         ),
         "context_len": bench_args.context_len,
@@ -446,6 +492,19 @@ def _worker(
     initialize_fp8_gemm_config(server_args)
     initialize_fp4_gemm_config(server_args)
     initialize_bf16_gemm_config(server_args)
+    iaas_client = None
+    if bench_args.indexer_mode == "iaas_fp4":
+        from sglang.srt.layers.attention.dsa.iaas_indexer_service import (
+            init_iaas_client,
+        )
+
+        torch.cuda.set_device(gpu_id)
+        iaas_client = init_iaas_client(
+            host=bench_args.iaas_host,
+            port=bench_args.iaas_port,
+            rank=tp_rank + 1,
+            device=torch.device("cuda", gpu_id),
+        )
     resolved_moe_backend = get_exec().moe.moe_runner_backend
     flag_moe_backend = get_moe_runner_backend().value
     if not (
@@ -477,6 +536,8 @@ def _worker(
         _reset_active_dummy_state(model_runner, active_reqs)
         if dist.is_initialized():
             dist.barrier()
+        if iaas_client is not None:
+            iaas_client.control_barrier()
 
         latencies_ms: List[float] = []
         cuda_graph_replay_steps: List[bool] = []
@@ -506,6 +567,27 @@ def _worker(
                     # Only report graph replay when every rank used it.
                     dist.all_reduce(graph_flag, op=dist.ReduceOp.MIN)
                 cuda_graph_replay_steps.append(bool(graph_flag.item()))
+
+        # Let the service leave the timed replay phase before model ranks do
+        # rank-local memory accounting and object collectives.
+        if iaas_client is not None:
+            iaas_client.control_barrier()
+
+        iaas_response_valid = (
+            iaas_client.response_is_valid(
+                actual_batch_size, bench_args.context_len
+            )
+            if iaas_client is not None
+            else None
+        )
+        if iaas_client is not None and dist.is_initialized():
+            valid_flag = torch.tensor(
+                int(iaas_response_valid),
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+            dist.all_reduce(valid_flag, op=dist.ReduceOp.MIN)
+            iaas_response_valid = bool(valid_flag.item())
 
         breakdown = _memory_breakdown(
             model_runner, bench_args, actual_batch_size
@@ -557,6 +639,12 @@ def _worker(
                 "point_config": point_config,
                 "hbm_breakdown_per_rank": all_breakdowns,
                 "synthetic_retrieval": bench_args.force_synthetic_retrieval,
+                "synthetic_overlap_fraction": (
+                    bench_args.synthetic_overlap_fraction
+                    if bench_args.synthetic_overlap_fraction >= 0
+                    else None
+                ),
+                "iaas_response_valid_all_ranks": iaas_response_valid,
                 "real_hisparse_io": True,
                 "real_sparse_attention": True,
                 "real_moe": True,
@@ -566,6 +654,9 @@ def _worker(
             with path.open("a") as fout:
                 fout.write(json.dumps(result) + "\n")
             rank_print(json.dumps(result, indent=2))
+
+    if iaas_client is not None:
+        iaas_client.shutdown()
 
 
 def main(
@@ -577,8 +668,52 @@ def main(
     port_args = PortArgs.init_new(server_args)
 
     workers = []
+    service_proc = None
+    device_offset = 0
+    if bench_args.indexer_mode == "iaas_fp4":
+        from sglang.srt.layers.attention.dsa.iaas_indexer_service import (
+            run_iaas_service,
+        )
+
+        if server_args.tp_size != 4 or server_args.dp_size != 4:
+            raise ValueError("iaas_fp4 currently requires TP=4 and DP=4")
+        if bench_args.force_synthetic_retrieval:
+            raise ValueError(
+                "iaas_fp4 must use --no-force-synthetic-retrieval so the "
+                "service top-k is not mislabeled as synthetic"
+            )
+        original_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if bench_args.iaas_service_device:
+            os.environ["CUDA_VISIBLE_DEVICES"] = bench_args.iaas_service_device
+            service_device_context = maybe_reindex_device_id(0)
+        else:
+            service_device_context = maybe_reindex_device_id(
+                bench_args.iaas_service_gpu_id
+            )
+        with service_device_context as service_gpu_id:
+            service_proc = multiprocessing.Process(
+                target=run_iaas_service,
+                kwargs={
+                    "host": bench_args.iaas_host,
+                    "port": bench_args.iaas_port,
+                    "gpu_id": service_gpu_id,
+                    "max_batch_per_client": bench_args.batch_size,
+                    "capture_batches": bench_args.active_batch_sizes(),
+                    "context_len": bench_args.context_len,
+                    "warmup_steps": bench_args.warmup_steps,
+                    "decode_steps": bench_args.decode_steps,
+                    "result_filename": bench_args.iaas_service_result_filename,
+                },
+            )
+            service_proc.start()
+        if original_visible_devices is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = original_visible_devices
+        workers.append(service_proc)
+
     for tp_rank in range(server_args.tp_size):
-        with maybe_reindex_device_id(tp_rank) as gpu_id:
+        with maybe_reindex_device_id(tp_rank + device_offset) as gpu_id:
             proc = multiprocessing.Process(
                 target=_worker,
                 args=(
@@ -593,10 +728,25 @@ def main(
             proc.start()
             workers.append(proc)
 
+    # A failed client leaves the service blocked in NCCL/store coordination.
+    # Poll all children together so one failure terminates its siblings rather
+    # than hanging the benchmark parent indefinitely.
     failed = False
-    for proc in workers:
-        proc.join()
-        failed = failed or proc.exitcode != 0
+    alive = set(workers)
+    while alive:
+        for proc in list(alive):
+            proc.join(timeout=0.2)
+            if proc.exitcode is None:
+                continue
+            alive.remove(proc)
+            if proc.exitcode != 0:
+                failed = True
+        if failed:
+            for proc in alive:
+                proc.terminate()
+            for proc in alive:
+                proc.join(timeout=10)
+            break
     if failed:
         raise RuntimeError(
             "one or more dummy-decode ranks failed; inspect the per-point log"

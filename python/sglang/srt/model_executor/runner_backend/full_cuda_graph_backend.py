@@ -27,6 +27,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -96,6 +97,17 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         # (its unscheduled profiler records the whole capture in one pass), so no
         # stepping happens here.
         runner = self._cuda_graph_runner
+        # IAAS uses an independent service process and NCCL communicator. Keep
+        # its eager warmups and local graph capture phase-aligned with the four
+        # model workers. Dense DSA variants do not call the remote indexer.
+        iaas_client = None
+        if envs.SGLANG_DSA_BENCHMARK_MODE.get() == "iaas_fp4":
+            from sglang.srt.layers.attention.dsa.iaas_indexer_service import (
+                get_iaas_client_if_initialized,
+            )
+
+            iaas_client = get_iaas_client_if_initialized()
+        sync_iaas = iaas_client is not None and shape_key.dsa_variant != "dense"
         profiler = (
             getattr(runner, "_profiler", None)
             if getattr(runner, "enable_profile_cuda_graph", False)
@@ -107,6 +119,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
+            if sync_iaas:
+                iaas_client.control_barrier()
             forward_fn()
             if profiler is not None:
                 profiler.step()
@@ -126,6 +140,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             )
         else:
             graph_ctx = self._device_module.graph
+
+        if sync_iaas:
+            iaas_client.control_barrier()
 
         with (
             graph_pool_capture_scope(),
