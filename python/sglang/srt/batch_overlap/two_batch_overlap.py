@@ -767,15 +767,94 @@ class TboForwardBatchPreparer:
             output_dict["input_ids"], output_dict["forward_mode"]
         )
 
-        # TODO improve, e.g. unify w/ `init_raw`
-        if (
-            get_parallel().moe_dense_tp_size == 1
-            and batch.global_dp_buffer_len is not None
-        ):
-            sum_len = end_token_index - start_token_index
-            global_dp_buffer_len = sum_len
+        # Preserve DP gather geometry for each TBO child.  DeepSeek-V3.2's
+        # non-EP DP-TP MoE path still gathers attention-DP-local rows before
+        # the experts.  Dropping these fields (the old TODO below) made CUDA
+        # graph capture call torch.empty((None, hidden)), and would also leave
+        # get_dp_local_info without its per-rank count tensor.
+        local_child_len = end_token_index - start_token_index
+        can_split_dp_counts = (
+            batch.global_dp_buffer_len is not None
+            and (
+                batch.forward_mode.is_decode()
+                or batch.forward_mode.is_target_verify()
+            )
+        )
+        if can_split_dp_counts:
+            token_num_per_seq = get_token_num_per_seq(
+                batch.forward_mode, batch.spec_info
+            )
+            assert token_num_per_seq is not None and token_num_per_seq > 0
+            is_child_a = start_token_index == 0
+
+            if batch.global_num_tokens_cpu is not None:
+                parent_counts_cpu = list(batch.global_num_tokens_cpu)
+                left_counts_cpu = [
+                    (count // token_num_per_seq // 2) * token_num_per_seq
+                    for count in parent_counts_cpu
+                ]
+                global_num_tokens_cpu = (
+                    left_counts_cpu
+                    if is_child_a
+                    else [
+                        count - left
+                        for count, left in zip(
+                            parent_counts_cpu, left_counts_cpu
+                        )
+                    ]
+                )
+            else:
+                global_num_tokens_cpu = None
+
+            if batch.global_num_tokens_gpu is not None:
+                parent_counts_gpu = batch.global_num_tokens_gpu
+                left_counts_gpu = (
+                    torch.div(
+                        parent_counts_gpu,
+                        token_num_per_seq,
+                        rounding_mode="floor",
+                    )
+                    // 2
+                    * token_num_per_seq
+                )
+                global_num_tokens_gpu = (
+                    left_counts_gpu
+                    if is_child_a
+                    else parent_counts_gpu - left_counts_gpu
+                )
+            elif global_num_tokens_cpu is not None:
+                global_num_tokens_gpu = torch.tensor(
+                    global_num_tokens_cpu,
+                    dtype=torch.int32,
+                    device=batch.input_ids.device,
+                )
+            else:
+                global_num_tokens_gpu = None
+
+            if batch.dp_padding_mode.is_max_len():
+                if global_num_tokens_cpu is not None:
+                    dp_width = len(global_num_tokens_cpu)
+                elif global_num_tokens_gpu is not None:
+                    dp_width = global_num_tokens_gpu.shape[0]
+                else:
+                    dp_width = get_parallel().dp_size
+                global_dp_buffer_len = local_child_len * dp_width
+            elif global_num_tokens_cpu is not None:
+                global_dp_buffer_len = sum(global_num_tokens_cpu)
+            else:
+                global_dp_buffer_len = None
         else:
-            global_dp_buffer_len = None
+            # Retain the upstream fallback for extend/mixed batches: their
+            # remote child sizes depend on per-sequence extend lengths, which
+            # cannot be reconstructed from the gathered total-token counts.
+            global_num_tokens_cpu = None
+            global_num_tokens_gpu = None
+            global_dp_buffer_len = (
+                local_child_len
+                if get_parallel().moe_dense_tp_size == 1
+                and batch.global_dp_buffer_len is not None
+                else None
+            )
 
         output_dict.update(
             dict(
@@ -787,8 +866,7 @@ class TboForwardBatchPreparer:
                 ),
                 extend_num_tokens=extend_num_tokens,
                 num_token_non_padded=out_num_token_non_padded,
-                # TODO: handle it when we need TBO + DeepSeek V3.2
-                num_token_non_padded_cpu=None,
+                num_token_non_padded_cpu=local_child_len,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
@@ -796,8 +874,8 @@ class TboForwardBatchPreparer:
                 _original_batch_size=None,
                 _original_forward_mode=None,
                 _original_num_tokens=None,
-                global_num_tokens_gpu=None,
-                global_num_tokens_cpu=None,
+                global_num_tokens_gpu=global_num_tokens_gpu,
+                global_num_tokens_cpu=global_num_tokens_cpu,
                 global_dp_buffer_len=global_dp_buffer_len,
                 global_num_tokens_for_logprob_gpu=None,
                 global_num_tokens_for_logprob_cpu=None,

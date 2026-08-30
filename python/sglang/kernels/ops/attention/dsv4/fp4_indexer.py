@@ -105,7 +105,10 @@ def _store_fp4_index_k_cache_kernel(
     token_id = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
     cache_loc = tl.load(loc + token_id)
-    page = cache_loc // page_size
+    # A service cache can exceed 2 GiB.  Keep the logical location compact,
+    # but promote byte-address arithmetic before multiplying by cache_stride;
+    # otherwise int32 wraps once page * stride crosses 2**31 bytes.
+    page = (cache_loc // page_size).to(tl.int64)
     page_offset = cache_loc - page * page_size
 
     k = tl.load(k_fp4 + token_id * BLOCK + offsets)
@@ -120,11 +123,16 @@ def _store_fp4_index_k_cache_kernel(
     )
 
 
-def quantize_fp4_indexer_tensor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_fp4_indexer_tensor_out(
+    x: torch.Tensor, x_fp4: torch.Tensor, x_sf: torch.Tensor
+) -> None:
     assert x.shape[-1] == 128
     x = x.contiguous().view(-1, x.shape[-1])
-    x_fp4 = torch.empty((x.shape[0], 64), device=x.device, dtype=torch.int8)
-    x_sf = torch.empty((x.shape[0],), device=x.device, dtype=torch.int32)
+    assert x_fp4.shape == (x.shape[0], 64)
+    assert x_fp4.dtype == torch.int8 and x_fp4.is_contiguous()
+    assert x_sf.shape == (x.shape[0],)
+    assert x_sf.dtype == torch.int32 and x_sf.is_contiguous()
+    assert x_fp4.device == x.device and x_sf.device == x.device
     if x.shape[0] > 0:
         _quantize_fp4_indexer_kernel[(x.shape[0],)](
             x,
@@ -133,6 +141,14 @@ def quantize_fp4_indexer_tensor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Te
             BLOCK_N=128,
             GROUP_N=32,
         )
+
+
+def quantize_fp4_indexer_tensor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    assert x.shape[-1] == 128
+    rows = x.numel() // x.shape[-1]
+    x_fp4 = torch.empty((rows, 64), device=x.device, dtype=torch.int8)
+    x_sf = torch.empty((rows,), device=x.device, dtype=torch.int32)
+    quantize_fp4_indexer_tensor_out(x, x_fp4, x_sf)
     return x_fp4, x_sf
 
 

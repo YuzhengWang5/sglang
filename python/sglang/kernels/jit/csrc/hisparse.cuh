@@ -320,9 +320,11 @@ struct SmemLayout {
 //
 // RecordMissPlan records this step's miss plan (miss_src/dst = host/device loc
 // per miss, miss_count per request) for shared-index skip layers to replay via
-// copy_cache_planned_kernel. SkipIO elides only the KV byte movement (timing
+// copy_cache_planned_kernel. RecordMissCount stores only the final scalar miss
+// count, avoiding per-miss plan writes in benchmark instrumentation. SkipIO
+// elides only the KV byte movement (timing
 // probe; output is garbage). Both are compile-time flags so the production
-// (false, false) instantiation stays byte-identical.
+// (false, false, false) instantiation stays byte-identical.
 template <
     int BLOCK_SIZE,
     int NUM_TOP_K,
@@ -330,6 +332,7 @@ template <
     bool IsMLA,
     bool IsDsv4Layout,
     bool RecordMissPlan,
+    bool RecordMissCount,
     bool SkipIO,
     typename SeqLensT,
     typename ReqPoolIndicesT>
@@ -407,7 +410,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       req_top_k_device_locs[i] = device_loc;
     }
     // Short sequences load nothing from host: an empty miss plan for this request.
-    if constexpr (RecordMissPlan) {
+    if constexpr (RecordMissPlan || RecordMissCount) {
       if (tid == 0) {
         miss_count_out[bid] = 0;
       }
@@ -632,7 +635,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   __syncthreads();
 
   total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
-  if constexpr (RecordMissPlan) {
+  if constexpr (RecordMissPlan || RecordMissCount) {
     if (tid == 0) {
       miss_count_out[bid] = total_misses;
     }
@@ -695,6 +698,7 @@ template <
     bool IsMLA,
     bool IsDsv4Layout,
     bool RecordMissPlan,
+    bool RecordMissCount,
     bool SkipIO>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
@@ -722,7 +726,9 @@ void load_cache_to_device_buffer(
   // Miss-plan side outputs; 0-dim sentinels when RecordMissPlan is false.
   int64_t* const miss_src_ptr = RecordMissPlan ? static_cast<int64_t*>(miss_src_out.data_ptr()) : nullptr;
   int32_t* const miss_dst_ptr = RecordMissPlan ? static_cast<int32_t*>(miss_dst_out.data_ptr()) : nullptr;
-  int32_t* const miss_count_ptr = RecordMissPlan ? static_cast<int32_t*>(miss_count_out.data_ptr()) : nullptr;
+  int32_t* const miss_count_ptr = (RecordMissPlan || RecordMissCount)
+      ? static_cast<int32_t*>(miss_count_out.data_ptr())
+      : nullptr;
   const int64_t plan_stride = RecordMissPlan ? miss_src_out.strides()[0] : 0;
   if (RecordMissPlan && miss_dst_out.strides()[0] != plan_stride) {
     throw std::runtime_error("load_cache_to_device_buffer: miss_src/miss_dst row strides differ");
@@ -784,6 +790,7 @@ void load_cache_to_device_buffer(
             IsMLA,
             IsDsv4Layout,
             RecordMissPlan,
+            RecordMissCount,
             SkipIO,
             int64_t,
             int64_t>,
@@ -798,6 +805,7 @@ void load_cache_to_device_buffer(
             IsMLA,
             IsDsv4Layout,
             RecordMissPlan,
+            RecordMissCount,
             SkipIO,
             int64_t,
             int32_t>,
@@ -812,6 +820,7 @@ void load_cache_to_device_buffer(
             IsMLA,
             IsDsv4Layout,
             RecordMissPlan,
+            RecordMissCount,
             SkipIO,
             int32_t,
             int64_t>,
@@ -826,6 +835,7 @@ void load_cache_to_device_buffer(
             IsMLA,
             IsDsv4Layout,
             RecordMissPlan,
+            RecordMissCount,
             SkipIO,
             int32_t,
             int32_t>,

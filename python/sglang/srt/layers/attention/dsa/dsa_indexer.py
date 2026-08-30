@@ -309,6 +309,23 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
         self.num_init_tokens = self.num_local_tokens = 0
+        # A device scalar keeps the controlled-locality trace replay-configurable
+        # without recapturing one CUDA graph per overlap point.  Allocate it
+        # before graph capture: creating it lazily inside capture would record
+        # its initializer and reset it on every replay.
+        benchmark_overlap = float(
+            os.environ.get("SGLANG_DSA_BENCHMARK_OVERLAP_FRACTION", "-1")
+        )
+        self._benchmark_overlap_retain: Optional[torch.Tensor] = (
+            torch.full(
+                (),
+                int(round(self.index_topk * benchmark_overlap)),
+                dtype=torch.int64,
+                device=get_device().device,
+            )
+            if benchmark_overlap >= 0
+            else None
+        )
         if config is not None:
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
@@ -522,34 +539,65 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         executes; it does not model semantic token identities.
         """
         seq_lens = forward_batch.seq_lens.to(device=device, dtype=torch.int64)
-        retain = int(round(self.index_topk * overlap_fraction))
+        if self._benchmark_overlap_retain is None:
+            self._benchmark_overlap_retain = torch.full(
+                (),
+                int(round(self.index_topk * overlap_fraction)),
+                dtype=torch.int64,
+                device=device,
+            )
+        retain = self._benchmark_overlap_retain
         churn = self.index_topk - retain
         offsets = torch.arange(self.index_topk, dtype=torch.int64, device=device)
         anchors = offsets.unsqueeze(0).expand(seq_lens.shape[0], -1)
-        if churn == 0:
-            return torch.where(
-                offsets.unsqueeze(0) < seq_lens.unsqueeze(1), anchors, -1
-            ).to(torch.int32)
-
-        churn_offsets = torch.arange(churn, dtype=torch.int64, device=device)
+        churn_offsets = (offsets - retain).clamp(min=0)
         available = (seq_lens - retain).clamp(min=1)
+        # Keep the circular churn domain constant across nearby decode steps.
+        # Using ``available`` itself as the modulus is subtly wrong because
+        # ``seq_len * churn % (seq_len - retain)`` nearly cancels the step
+        # dependence.  A top-k-aligned floor stays constant throughout the
+        # benchmark's short decode interval while remaining below seq_len.
+        domain_quantum = 2 * self.index_topk
+        floored_domain = torch.div(
+            available, domain_quantum, rounding_mode="floor"
+        ) * domain_quantum
+        churn_domain = torch.where(
+            available >= domain_quantum,
+            floored_domain,
+            available,
+        ).clamp(min=1)
         rows = torch.arange(seq_lens.shape[0], dtype=torch.int64, device=device)
         start = torch.remainder(
             seq_lens * churn + int(layer_id) * 104729 + rows * 8191,
-            available,
+            churn_domain,
         )
         churn_indices = retain + torch.remainder(
             start.unsqueeze(1) + churn_offsets.unsqueeze(0),
-            available.unsqueeze(1),
+            churn_domain.unsqueeze(1),
         )
-        result = anchors.clone()
-        result[:, retain:] = churn_indices
+        result = torch.where(
+            offsets.unsqueeze(0) < retain,
+            anchors,
+            churn_indices,
+        )
         valid_rows = seq_lens >= self.index_topk
         recent = self._synthetic_recent_decode_topk(
             forward_batch, device=device
         ).to(torch.int64)
         result = torch.where(valid_rows.unsqueeze(1), result, recent)
         return result.to(torch.int32)
+
+    def set_benchmark_overlap_fraction(self, overlap_fraction: float) -> None:
+        if not 0.0 <= overlap_fraction <= 1.0:
+            raise ValueError("benchmark overlap fraction must be in [0, 1]")
+        if self._benchmark_overlap_retain is None:
+            raise RuntimeError(
+                "benchmark overlap scalar was not captured; enable a nonnegative "
+                "--synthetic-overlap-fraction before model initialization"
+            )
+        self._benchmark_overlap_retain.fill_(
+            int(round(self.index_topk * overlap_fraction))
+        )
 
     def _get_q_k_bf16(
         self,

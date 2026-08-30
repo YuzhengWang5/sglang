@@ -20,10 +20,11 @@ def _jit_sparse_module(
     is_mla: bool = False,
     is_dsv4_layout: bool = False,
     record_miss_plan: bool = False,
+    record_miss_count: bool = False,
     skip_io: bool = False,
 ) -> Module:
-    # record_miss_plan / skip_io are compile-time kernel flags; the
-    # (False, False) production instantiation stays byte-identical.
+    # record_miss_plan / record_miss_count / skip_io are compile-time kernel flags; the
+    # (False, False, False) production instantiation stays byte-identical.
     template_args = make_cpp_args(
         block_size,
         num_top_k,
@@ -31,6 +32,7 @@ def _jit_sparse_module(
         is_mla,
         is_dsv4_layout,
         record_miss_plan,
+        record_miss_count,
         skip_io,
     )
     cache_args = make_cpp_args(
@@ -41,6 +43,7 @@ def _jit_sparse_module(
         is_mla,
         is_dsv4_layout,
         record_miss_plan,
+        record_miss_count,
         skip_io,
     )
     return load_jit(
@@ -142,6 +145,7 @@ def _load_cache_to_device_buffer_mla(
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
 
     record_miss_plan = miss_src is not None
+    record_miss_count = miss_count is not None
     module = _jit_sparse_module(
         item_size_bytes,
         block_size,
@@ -150,6 +154,7 @@ def _load_cache_to_device_buffer_mla(
         is_mla=True,
         is_dsv4_layout=is_dsv4_layout,
         record_miss_plan=record_miss_plan,
+        record_miss_count=record_miss_count,
         skip_io=skip_io,
     )
 
@@ -167,8 +172,13 @@ def _load_cache_to_device_buffer_mla(
         # The kernel indexes both plan rows with one stride.
         assert miss_src.stride(0) == miss_dst.stride(0)
     else:
-        # Unused sentinels; the RecordMissPlan=false instantiation never reads them.
-        miss_src = miss_dst = miss_count = empty
+        # Count-only benchmark instrumentation avoids the per-miss source/dst
+        # plan writes and records just one int32 per request.
+        miss_src = miss_dst = empty
+        if record_miss_count:
+            assert miss_count.dtype == torch.int32
+        else:
+            miss_count = empty
 
     module.load_cache_to_device_buffer(
         top_k_tokens,

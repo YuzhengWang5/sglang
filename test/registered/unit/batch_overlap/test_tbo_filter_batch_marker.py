@@ -10,6 +10,7 @@ import unittest
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -76,6 +77,43 @@ class TestTboFilterBatchMarker(CustomTestCase):
         child = _filter(parent, lo=0, hi=4)
         self.assertFalse(child.forward_metadata_ready)
         self.assertFalse(child.forward_metadata_replan_equivalent)
+
+    def test_filter_batch_preserves_dp_gather_geometry(self):
+        parent = _make_target_verify_batch(8)
+        parent.forward_mode = ForwardMode.DECODE
+        parent.dp_padding_mode = DpPaddingMode.MAX_LEN
+        parent.global_num_tokens_cpu = [8, 8, 8, 8]
+        parent.global_num_tokens_gpu = torch.tensor(
+            [8, 8, 8, 8], dtype=torch.int32
+        )
+        parent.global_dp_buffer_len = 32
+
+        child = _filter(parent, lo=0, hi=4)
+
+        self.assertEqual(child.global_num_tokens_cpu, [4, 4, 4, 4])
+        self.assertEqual(child.global_num_tokens_gpu.dtype, torch.int32)
+        self.assertEqual(child.global_num_tokens_gpu.tolist(), [4, 4, 4, 4])
+        self.assertEqual(child.global_dp_buffer_len, 16)
+
+    def test_filter_batch_splits_uneven_sum_len_counts_per_rank(self):
+        parent = _make_target_verify_batch(8)
+        parent.forward_mode = ForwardMode.DECODE
+        parent.dp_padding_mode = DpPaddingMode.SUM_LEN
+        parent.global_num_tokens_cpu = [7, 8, 9, 10]
+        parent.global_num_tokens_gpu = torch.tensor(
+            [7, 8, 9, 10], dtype=torch.int32
+        )
+        parent.global_dp_buffer_len = 34
+
+        child_a = _filter(parent, lo=0, hi=4)
+        child_b = _filter(parent, lo=4, hi=8)
+
+        self.assertEqual(child_a.global_num_tokens_cpu, [3, 4, 4, 5])
+        self.assertEqual(child_a.global_num_tokens_gpu.tolist(), [3, 4, 4, 5])
+        self.assertEqual(child_a.global_dp_buffer_len, 16)
+        self.assertEqual(child_b.global_num_tokens_cpu, [4, 4, 5, 5])
+        self.assertEqual(child_b.global_num_tokens_gpu.tolist(), [4, 4, 5, 5])
+        self.assertEqual(child_b.global_dp_buffer_len, 18)
 
 
 def _make_valued_batch(bs: int) -> ForwardBatch:

@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.dsv4 import (
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     quantize_fp4_indexer_tensor,
+    quantize_fp4_indexer_tensor_out,
     store_fp4_index_k_cache,
 )
 from sglang.srt.utils import get_device, is_xpu
@@ -112,6 +113,20 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     x_fp4, x_sf = quantize_fp4_indexer_tensor(x)
     ref_fp4, ref_sf = _ref_quantize_fp4_indexer(x)
 
+    torch.testing.assert_close(x_fp4.view(torch.uint8), ref_fp4)
+    torch.testing.assert_close(x_sf, ref_sf)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 96])
+def test_quantize_fp4_indexer_tensor_out(num_tokens: int) -> None:
+    torch.manual_seed(num_tokens + 1000)
+    x = torch.randn(num_tokens, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
+    x_fp4 = torch.empty(num_tokens, FP4_DIM, device=get_device(), dtype=torch.int8)
+    x_sf = torch.empty(num_tokens, device=get_device(), dtype=torch.int32)
+
+    quantize_fp4_indexer_tensor_out(x, x_fp4, x_sf)
+
+    ref_fp4, ref_sf = _ref_quantize_fp4_indexer(x)
     torch.testing.assert_close(x_fp4.view(torch.uint8), ref_fp4)
     torch.testing.assert_close(x_sf, ref_sf)
 

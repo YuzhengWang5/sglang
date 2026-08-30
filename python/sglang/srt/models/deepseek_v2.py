@@ -1654,15 +1654,23 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def op_dispatch_a(self, state):
-        if self.ep_size > 1:
+        if self._enable_a2a_moe:
             self.experts.dispatcher.dispatch_a(
                 hidden_states=state.hidden_states_mlp_input,
                 topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
+        else:
+            # Non-EP DP-TP MoE uses the standard dispatcher.  In the NVFP4
+            # path this performs the quantized all-gather and returns a regular
+            # DispatchOutput for run_moe_core; it has no dispatch_a/b API.
+            state.dispatch_output = self.experts.dispatcher.dispatch(
+                hidden_states=state.hidden_states_mlp_input,
+                topk_output=state.pop("topk_output"),
+            )
 
     def op_dispatch_b(self, state):
-        if self.ep_size > 1:
+        if self._enable_a2a_moe:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
@@ -1676,15 +1684,22 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def op_combine_a(self, state):
-        if self.ep_size > 1:
+        if self._enable_a2a_moe:
             self.experts.dispatcher.combine_a(
                 combine_input=state.pop("combine_input"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
             state.pop("dispatch_output")
+        else:
+            # Standard NVFP4 combine owns the matching reduce-scatterv and
+            # immediately restores this child's attention-DP-local rows.
+            state.hidden_states_after_combine = self.experts.dispatcher.combine(
+                combine_input=state.pop("combine_input")
+            )
+            state.pop("dispatch_output")
 
     def op_combine_b(self, state):
-        if self.ep_size > 1:
+        if self._enable_a2a_moe:
             state.hidden_states_after_combine = self.experts.dispatcher.combine_b(
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )

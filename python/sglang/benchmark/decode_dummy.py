@@ -71,11 +71,15 @@ class DummyDecodeArgs:
     result_filename: str = "decode_dummy.jsonl"
     force_synthetic_retrieval: bool = True
     synthetic_overlap_fraction: float = -1.0
+    synthetic_overlap_fractions: str = ""
+    record_retrieval_misses: bool = False
     iaas_host: str = "127.0.0.1"
     iaas_port: int = 29649
     iaas_service_gpu_id: int = 4
     iaas_service_device: str = ""
     iaas_service_result_filename: str = "iaas_service.json"
+    iaas_fused_request_mailbox: bool = False
+    iaas_service_client_wave_size: int = 4
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -101,6 +105,23 @@ class DummyDecodeArgs:
                 "between adjacent steps after running the configured indexer."
             ),
         )
+        parser.add_argument(
+            "--synthetic-overlap-fractions",
+            default="",
+            help=(
+                "Comma-separated controlled-locality points. They reuse one "
+                "captured graph by updating a device retain-count scalar."
+            ),
+        )
+        parser.add_argument(
+            "--record-retrieval-misses",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help=(
+                "Record actual HiSparse swap-in misses. This adds one int32 "
+                "store per layer/request and is intended for locality sweeps."
+            ),
+        )
         parser.add_argument("--iaas-host", default="127.0.0.1")
         parser.add_argument("--iaas-port", type=int, default=29649)
         parser.add_argument("--iaas-service-gpu-id", type=int, default=4)
@@ -111,6 +132,22 @@ class DummyDecodeArgs:
         )
         parser.add_argument(
             "--iaas-service-result-filename", default="iaas_service.json"
+        )
+        parser.add_argument(
+            "--iaas-fused-request-mailbox",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Fuse the five per-layer IAAS request tensors into one p2p message.",
+        )
+        parser.add_argument(
+            "--iaas-service-client-wave-size",
+            type=int,
+            choices=(1, 2, 4),
+            default=4,
+            help=(
+                "Number of attention-DP clients the IAAS GPU batches before "
+                "returning responses. Smaller waves expose cross-DP overlap."
+            ),
         )
         parser.add_argument(
             "--no-force-synthetic-retrieval",
@@ -140,6 +177,17 @@ class DummyDecodeArgs:
             raise ValueError(
                 f"active batch {values[-1]} exceeds allocation batch {self.batch_size}"
             )
+        return values
+
+    def overlap_fractions(self) -> List[float]:
+        if self.synthetic_overlap_fractions.strip():
+            values = [
+                float(value) for value in self.synthetic_overlap_fractions.split(",")
+            ]
+            if any(not 0.0 <= value <= 1.0 for value in values):
+                raise ValueError("all synthetic overlap fractions must be in [0, 1]")
+        else:
+            values = [self.synthetic_overlap_fraction]
         return values
 
 
@@ -196,8 +244,16 @@ def _configure_cli_for_point(
     )
     if not (-1.0 <= bench_args.synthetic_overlap_fraction <= 1.0):
         raise ValueError("--synthetic-overlap-fraction must be -1 or in [0, 1]")
+    overlap_fractions = (
+        bench_args.overlap_fractions()
+        if bench_args.synthetic_overlap_fractions.strip()
+        else [bench_args.synthetic_overlap_fraction]
+    )
     os.environ["SGLANG_DSA_BENCHMARK_OVERLAP_FRACTION"] = str(
-        bench_args.synthetic_overlap_fraction
+        overlap_fractions[0]
+    )
+    os.environ["SGLANG_DSA_BENCHMARK_RECORD_MISSES"] = (
+        "1" if bench_args.record_retrieval_misses else "0"
     )
     os.environ["SGLANG_DSA_DUMMY_KV_HOST_SIZE_GB"] = str(
         bench_args.dummy_host_size_gb
@@ -213,6 +269,7 @@ def _configure_cli_for_point(
         "node_max_running_requests": args.max_running_requests,
         "allocation_batch_size_per_dp_rank": bench_args.batch_size,
         "active_batch_sizes_per_dp_rank": bench_args.active_batch_sizes(),
+        "synthetic_overlap_fractions": overlap_fractions,
     }
 
 
@@ -419,6 +476,7 @@ def _memory_breakdown(
             coord.top_k_device_locs_buffer,
             coord.raw_indices_buffer,
             coord.num_real_reqs,
+            getattr(coord, "benchmark_miss_counts", None),
         ]
     )
     torch_allocated = torch.cuda.memory_allocated(model_runner.device)
@@ -473,6 +531,19 @@ def _run_forward(batch, model_runner) -> bool:
     return bool(output.can_run_graph)
 
 
+def _set_benchmark_overlap_fraction(model_runner, overlap_fraction: float) -> int:
+    from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+
+    count = 0
+    for module in model_runner.model.modules():
+        if isinstance(module, Indexer):
+            module.set_benchmark_overlap_fraction(overlap_fraction)
+            count += 1
+    if count == 0:
+        raise RuntimeError("no DSA Indexer modules found for locality sweep")
+    return count
+
+
 def _worker(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -504,6 +575,7 @@ def _worker(
             port=bench_args.iaas_port,
             rank=tp_rank + 1,
             device=torch.device("cuda", gpu_id),
+            fused_request_mailbox=bench_args.iaas_fused_request_mailbox,
         )
     resolved_moe_backend = get_exec().moe.moe_runner_backend
     flag_moe_backend = get_moe_runner_backend().value
@@ -529,10 +601,17 @@ def _worker(
     if start_len <= 2048:
         raise ValueError("context_len must exceed top-k plus all benchmark steps")
 
-    for actual_batch_size in bench_args.active_batch_sizes():
+    benchmark_points = [
+        (batch, overlap)
+        for batch in bench_args.active_batch_sizes()
+        for overlap in bench_args.overlap_fractions()
+    ]
+    for actual_batch_size, overlap_fraction in benchmark_points:
         active_reqs = reqs[:actual_batch_size]
         active_logical_rows = logical_rows[:actual_batch_size]
         batch = _build_dummy_batch(model_runner, active_reqs, tree_cache)
+        if overlap_fraction >= 0:
+            _set_benchmark_overlap_fraction(model_runner, overlap_fraction)
         _reset_active_dummy_state(model_runner, active_reqs)
         if dist.is_initialized():
             dist.barrier()
@@ -541,6 +620,7 @@ def _worker(
 
         latencies_ms: List[float] = []
         cuda_graph_replay_steps: List[bool] = []
+        retrieval_misses_per_rank_step: List[int] = []
         for step in range(total_steps):
             seq_len = start_len + step + 1
             _set_step_state(batch, active_logical_rows, model_runner, seq_len)
@@ -558,6 +638,20 @@ def _worker(
                 dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
             if step >= bench_args.warmup_steps:
                 latencies_ms.append(float(elapsed.item()))
+                benchmark_miss_counts = getattr(
+                    model_runner.hisparse_coordinator,
+                    "benchmark_miss_counts",
+                    None,
+                )
+                if benchmark_miss_counts is not None:
+                    active_slots = batch.req_pool_indices.to(torch.long)
+                    retrieval_misses_per_rank_step.append(
+                        int(
+                            benchmark_miss_counts.index_select(1, active_slots)
+                            .sum()
+                            .item()
+                        )
+                    )
                 graph_flag = torch.tensor(
                     int(replayed_cuda_graph),
                     dtype=torch.int32,
@@ -640,11 +734,59 @@ def _worker(
                 "hbm_breakdown_per_rank": all_breakdowns,
                 "synthetic_retrieval": bench_args.force_synthetic_retrieval,
                 "synthetic_overlap_fraction": (
-                    bench_args.synthetic_overlap_fraction
-                    if bench_args.synthetic_overlap_fraction >= 0
+                    overlap_fraction
+                    if overlap_fraction >= 0
                     else None
                 ),
+                "retrieval_retain_tokens_per_request": (
+                    int(round(2048 * overlap_fraction))
+                    if overlap_fraction >= 0
+                    else None
+                ),
+                "retrieval_churn_tokens_per_request": (
+                    2048 - int(round(2048 * overlap_fraction))
+                    if overlap_fraction >= 0
+                    else None
+                ),
+                "nominal_retrieval_churn_fraction": (
+                    (2048 - int(round(2048 * overlap_fraction))) / 2048
+                    if overlap_fraction >= 0
+                    else None
+                ),
+                "measured_retrieval_misses_per_rank_step": (
+                    retrieval_misses_per_rank_step
+                    if retrieval_misses_per_rank_step
+                    else None
+                ),
+                "measured_retrieval_miss_fraction": (
+                    float(np.mean(retrieval_misses_per_rank_step))
+                    / (
+                        model_runner.hisparse_coordinator.mem_pool_device.layer_num
+                        * actual_batch_size
+                        * 2048
+                    )
+                    if retrieval_misses_per_rank_step
+                    else None
+                ),
+                "retrieval_trace_family": (
+                    "deterministic_anchor_disjoint_churn_v2_fixed_domain"
+                    if overlap_fraction >= 0
+                    else None
+                ),
+                "retrieval_miss_counter_enabled": (
+                    bench_args.record_retrieval_misses
+                ),
                 "iaas_response_valid_all_ranks": iaas_response_valid,
+                "iaas_fused_request_mailbox": (
+                    bench_args.iaas_fused_request_mailbox
+                    if iaas_client is not None
+                    else None
+                ),
+                "iaas_service_client_wave_size": (
+                    bench_args.iaas_service_client_wave_size
+                    if iaas_client is not None
+                    else None
+                ),
                 "real_hisparse_io": True,
                 "real_sparse_attention": True,
                 "real_moe": True,
@@ -703,6 +845,18 @@ def main(
                     "warmup_steps": bench_args.warmup_steps,
                     "decode_steps": bench_args.decode_steps,
                     "result_filename": bench_args.iaas_service_result_filename,
+                    "fused_request_mailbox": (
+                        bench_args.iaas_fused_request_mailbox
+                    ),
+                    "two_batch_overlap": server_args.enable_two_batch_overlap,
+                    "client_wave_size": (
+                        bench_args.iaas_service_client_wave_size
+                    ),
+                    "decode_point_batches": [
+                        batch
+                        for batch in bench_args.active_batch_sizes()
+                        for _ in bench_args.overlap_fractions()
+                    ],
                 },
             )
             service_proc.start()

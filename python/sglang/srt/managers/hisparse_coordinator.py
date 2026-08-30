@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+import os
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -251,6 +252,13 @@ class HiSparseCoordinator:
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
+        self.benchmark_miss_counts = (
+            torch.zeros(
+                (layer_num, max_num_req_slots), dtype=torch.int32, device=device
+            )
+            if os.environ.get("SGLANG_DSA_BENCHMARK_RECORD_MISSES", "0") == "1"
+            else None
+        )
 
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
@@ -962,7 +970,11 @@ class HiSparseCoordinator:
                 miss_count=self._miss_count[:num_reqs],
             )
             if record_plan
-            else {}
+            else (
+                {"miss_count": self.benchmark_miss_counts[layer_id, :num_reqs]}
+                if self.benchmark_miss_counts is not None
+                else {}
+            )
         )
         swap_in_fn(
             top_k_tokens=top_k_result,
