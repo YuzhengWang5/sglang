@@ -360,6 +360,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             "oracle_no_index",
             "oracle_recent",
             "iaas_fp4",
+            "iaas_fp8",
         ):
             return 0
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)

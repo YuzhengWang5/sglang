@@ -30,29 +30,75 @@ from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicato
 from sglang.srt.distributed.utils import StatelessProcessGroup
 
 
-IAAS_WORLD_SIZE = 5
-IAAS_CLIENTS = 4
 IAAS_PAGE_SIZE = 64
-IAAS_HEADS = 64
-IAAS_HEAD_DIM = 128
-IAAS_TOPK = 2048
-IAAS_LAYERS = 61
+IAAS_DEFAULT_CLIENTS = 4
+IAAS_DEFAULT_HEADS = 64
+IAAS_DEFAULT_HEAD_DIM = 128
+IAAS_DEFAULT_TOPK = 2048
+IAAS_DEFAULT_LAYERS = 61
 # DeepSeek-V3.2 executes the first ``first_k_dense_replace`` layers outside the
 # sparse-layer TBO scheduler.  Their attention requests therefore remain full
 # batch, while layers at and after this boundary issue two half-batch requests.
 IAAS_TBO_FIRST_LAYER = 3
-IAAS_Q_DATA_BYTES_PER_ROW = IAAS_HEADS * IAAS_HEAD_DIM // 2
-IAAS_Q_SCALE_BYTES_PER_ROW = IAAS_HEADS * 4
-IAAS_WEIGHTS_BYTES_PER_ROW = IAAS_HEADS * 4
-IAAS_K_DATA_BYTES_PER_ROW = IAAS_HEAD_DIM // 2
-IAAS_K_SCALE_BYTES_PER_ROW = 4
-IAAS_REQUEST_BYTES_PER_ROW = (
-    IAAS_Q_DATA_BYTES_PER_ROW
-    + IAAS_Q_SCALE_BYTES_PER_ROW
-    + IAAS_WEIGHTS_BYTES_PER_ROW
-    + IAAS_K_DATA_BYTES_PER_ROW
-    + IAAS_K_SCALE_BYTES_PER_ROW
-)
+
+
+@dataclass(frozen=True)
+class IAASSpec:
+    clients: int = IAAS_DEFAULT_CLIENTS
+    heads: int = IAAS_DEFAULT_HEADS
+    head_dim: int = IAAS_DEFAULT_HEAD_DIM
+    topk: int = IAAS_DEFAULT_TOPK
+    layers: int = IAAS_DEFAULT_LAYERS
+    cache_dtype: str = "fp4"
+
+    def __post_init__(self) -> None:
+        if self.clients <= 0:
+            raise ValueError("IAAS clients must be positive")
+        if self.heads <= 0 or self.head_dim != 128 or self.topk <= 0:
+            raise ValueError(f"invalid IAAS model shape: {self}")
+        if self.layers <= 0:
+            raise ValueError("IAAS layers must be positive")
+        if self.cache_dtype not in ("fp4", "fp8"):
+            raise ValueError("IAAS cache dtype must be fp4 or fp8")
+
+    @property
+    def world_size(self) -> int:
+        return self.clients + 1
+
+    @property
+    def q_data_bytes_per_row(self) -> int:
+        divisor = 2 if self.cache_dtype == "fp4" else 1
+        return self.heads * self.head_dim // divisor
+
+    @property
+    def q_scale_bytes_per_row(self) -> int:
+        return self.heads * 4
+
+    @property
+    def weights_bytes_per_row(self) -> int:
+        return self.heads * 4
+
+    @property
+    def k_data_bytes_per_row(self) -> int:
+        return self.head_dim // (2 if self.cache_dtype == "fp4" else 1)
+
+    @property
+    def k_scale_bytes_per_row(self) -> int:
+        return 4
+
+    @property
+    def request_bytes_per_row(self) -> int:
+        return (
+            self.q_data_bytes_per_row
+            + self.q_scale_bytes_per_row
+            + self.weights_bytes_per_row
+            + self.k_data_bytes_per_row
+            + self.k_scale_bytes_per_row
+        )
+
+    @property
+    def cache_bytes_per_token(self) -> int:
+        return 68 if self.cache_dtype == "fp4" else 132
 
 
 _client: Optional["IAASClient"] = None
@@ -132,15 +178,19 @@ class IAASClient:
         port: int,
         rank: int,
         device: torch.device,
+        spec: IAASSpec,
         fused_request_mailbox: bool = False,
     ) -> None:
-        if rank <= 0 or rank >= IAAS_WORLD_SIZE:
-            raise ValueError(f"IAAS client rank must be 1..4, got {rank}")
+        if rank <= 0 or rank >= spec.world_size:
+            raise ValueError(
+                f"IAAS client rank must be 1..{spec.clients}, got {rank}"
+            )
         self.rank = rank
         self.device = device
+        self.spec = spec
         self.fused_request_mailbox = fused_request_mailbox
         self.group = StatelessProcessGroup.create(
-            host, port, rank, IAAS_WORLD_SIZE
+            host, port, rank, spec.world_size
         )
         self.group.store.set_timeout(timedelta(hours=1))
         self.comm = PyNcclCommunicator(self.group, device)
@@ -148,8 +198,8 @@ class IAASClient:
             raise RuntimeError("IAAS PyNcclCommunicator is unavailable")
         self.responses_by_batch: Dict[int, torch.Tensor] = {}
 
-    @staticmethod
     def _encode_fused_request(
+        self,
         query: torch.Tensor,
         key: torch.Tensor,
         weights: torch.Tensor,
@@ -157,36 +207,60 @@ class IAASClient:
         """Quantize directly into one client-major graph-captured mailbox."""
         batch = query.shape[0]
         request = torch.empty(
-            batch * IAAS_REQUEST_BYTES_PER_ROW,
+            batch * self.spec.request_bytes_per_row,
             dtype=torch.uint8,
             device=query.device,
         )
-        q_bytes = batch * IAAS_Q_DATA_BYTES_PER_ROW
-        q_scale_bytes = batch * IAAS_Q_SCALE_BYTES_PER_ROW
-        weights_bytes = batch * IAAS_WEIGHTS_BYTES_PER_ROW
-        k_bytes = batch * IAAS_K_DATA_BYTES_PER_ROW
+        q_bytes = batch * self.spec.q_data_bytes_per_row
+        q_scale_bytes = batch * self.spec.q_scale_bytes_per_row
+        weights_bytes = batch * self.spec.weights_bytes_per_row
+        k_bytes = batch * self.spec.k_data_bytes_per_row
         q_end = q_bytes
         q_scale_end = q_end + q_scale_bytes
         weights_end = q_scale_end + weights_bytes
         k_end = weights_end + k_bytes
-        q_data = request[:q_end].view(torch.int8).view(
-            batch, 1, IAAS_HEADS, IAAS_HEAD_DIM // 2
+        data_dtype = (
+            torch.int8
+            if self.spec.cache_dtype == "fp4"
+            else torch.float8_e4m3fn
         )
-        q_scale = request[q_end:q_scale_end].view(torch.int32).view(
-            batch, 1, IAAS_HEADS
+        q_data = request[:q_end].view(data_dtype).view(
+            batch, 1, self.spec.heads, self.spec.q_data_bytes_per_row // self.spec.heads
+        )
+        scale_dtype = (
+            torch.int32 if self.spec.cache_dtype == "fp4" else torch.float32
+        )
+        q_scale = request[q_end:q_scale_end].view(scale_dtype).view(
+            batch, 1, self.spec.heads
         )
         weights_out = request[q_scale_end:weights_end].view(torch.float32).view(
-            batch, IAAS_HEADS
+            batch, self.spec.heads
         )
-        k_data = request[weights_end:k_end].view(torch.int8).view(
-            batch, IAAS_HEAD_DIM // 2
+        k_data = request[weights_end:k_end].view(data_dtype).view(
+            batch, self.spec.k_data_bytes_per_row
         )
-        k_scale = request[k_end:].view(torch.int32).view(batch)
-        quantize_fp4_indexer_tensor_out(
-            query, q_data.view(-1, IAAS_HEAD_DIM // 2), q_scale.view(-1)
+        k_scale = request[k_end:].view(scale_dtype).view(batch)
+        if self.spec.cache_dtype == "fp4":
+            quantize_fp4_indexer_tensor_out(
+                query,
+                q_data.view(-1, self.spec.head_dim // 2),
+                q_scale.view(-1),
+            )
+            quantize_fp4_indexer_tensor_out(key, k_data, k_scale)
+        else:
+            from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+
+            q_quant, q_quant_scale = act_quant(query.contiguous())
+            k_quant, k_quant_scale = act_quant(key.contiguous())
+            q_data.copy_(q_quant.view_as(q_data))
+            q_scale.copy_(q_quant_scale.view_as(q_scale))
+            k_data.copy_(k_quant.view_as(k_data))
+            k_scale.copy_(k_quant_scale.view_as(k_scale))
+        weights_out.copy_(
+            weights
+            if self.spec.cache_dtype == "fp4"
+            else weights * q_scale.view(batch, self.spec.heads)
         )
-        quantize_fp4_indexer_tensor_out(key, k_data, k_scale)
-        weights_out.copy_(weights)
         return request
 
     def control_barrier(self) -> None:
@@ -200,25 +274,40 @@ class IAASClient:
         weights: torch.Tensor,
     ) -> torch.Tensor:
         batch = query.shape[0]
-        if query.shape != (batch, IAAS_HEADS, IAAS_HEAD_DIM):
+        if query.shape != (batch, self.spec.heads, self.spec.head_dim):
             raise ValueError(f"unexpected IAAS query shape {query.shape}")
-        if key.shape != (batch, IAAS_HEAD_DIM):
+        if key.shape != (batch, self.spec.head_dim):
             raise ValueError(f"unexpected IAAS key shape {key.shape}")
-        if weights.shape != (batch, IAAS_HEADS):
+        if weights.shape != (batch, self.spec.heads):
             raise ValueError(f"unexpected IAAS weights shape {weights.shape}")
 
         weights = weights.to(torch.float32).contiguous()
         if self.fused_request_mailbox:
             request = self._encode_fused_request(query, key, weights)
         else:
-            q_data, q_scale = quantize_fp4_indexer_tensor(query.contiguous())
-            k_data, k_scale = quantize_fp4_indexer_tensor(key.contiguous())
-            q_data = q_data.view(batch, 1, IAAS_HEADS, IAAS_HEAD_DIM // 2)
-            q_scale = q_scale.view(batch, 1, IAAS_HEADS)
-            k_data = k_data.view(batch, IAAS_HEAD_DIM // 2)
-            k_scale = k_scale.view(batch)
+            if self.spec.cache_dtype == "fp4":
+                q_data, q_scale = quantize_fp4_indexer_tensor(query.contiguous())
+                k_data, k_scale = quantize_fp4_indexer_tensor(key.contiguous())
+                q_data = q_data.view(
+                    batch, 1, self.spec.heads, self.spec.head_dim // 2
+                )
+                q_scale = q_scale.view(batch, 1, self.spec.heads)
+                k_data = k_data.view(batch, self.spec.head_dim // 2)
+                k_scale = k_scale.view(batch)
+            else:
+                from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+
+                q_data, q_scale = act_quant(query.contiguous())
+                k_data, k_scale = act_quant(key.contiguous())
+                q_data = q_data.view(
+                    batch, 1, self.spec.heads, self.spec.head_dim
+                )
+                q_scale = q_scale.view(batch, 1, self.spec.heads)
+                k_data = k_data.view(batch, self.spec.head_dim)
+                k_scale = k_scale.view(batch)
+                weights = weights * q_scale.view(batch, self.spec.heads)
         response = torch.empty(
-            (batch, IAAS_TOPK), dtype=torch.int32, device=query.device
+            (batch, self.spec.topk), dtype=torch.int32, device=query.device
         )
         self.responses_by_batch[batch] = response
 
@@ -255,16 +344,31 @@ def init_iaas_client(
     port: int,
     rank: int,
     device: torch.device,
+    clients: int = IAAS_DEFAULT_CLIENTS,
+    heads: int = IAAS_DEFAULT_HEADS,
+    head_dim: int = IAAS_DEFAULT_HEAD_DIM,
+    topk: int = IAAS_DEFAULT_TOPK,
+    layers: int = IAAS_DEFAULT_LAYERS,
+    cache_dtype: str = "fp4",
     fused_request_mailbox: bool = False,
 ) -> IAASClient:
     global _client
     if _client is not None:
         raise RuntimeError("IAAS client is already initialized")
+    spec = IAASSpec(
+        clients=clients,
+        heads=heads,
+        head_dim=head_dim,
+        topk=topk,
+        layers=layers,
+        cache_dtype=cache_dtype,
+    )
     _client = IAASClient(
         host=host,
         port=port,
         rank=rank,
         device=device,
+        spec=spec,
         fused_request_mailbox=fused_request_mailbox,
     )
     return _client
@@ -290,6 +394,7 @@ class _ServiceBuffers:
     weights: torch.Tensor
     k_data: torch.Tensor
     k_scale: torch.Tensor
+    k_row: Optional[torch.Tensor]
     responses: torch.Tensor
     seqlens_2d: torch.Tensor
     lengths: torch.Tensor
@@ -310,29 +415,35 @@ class IAASService:
         max_batch_per_client: int,
         context_len: int,
         capture_batches: Sequence[int],
+        spec: IAASSpec,
         fused_request_mailbox: bool = False,
         two_batch_overlap: bool = False,
-        client_wave_size: int = IAAS_CLIENTS,
+        client_wave_size: Optional[int] = None,
         tbo_first_layer: int = IAAS_TBO_FIRST_LAYER,
     ) -> None:
         self.device = device
+        self.spec = spec
         self.max_batch_per_client = max_batch_per_client
         self.context_len = context_len
         self.capture_batches = tuple(sorted(set(capture_batches)))
         self.fused_request_mailbox = fused_request_mailbox
         self.two_batch_overlap = two_batch_overlap
-        self.client_wave_size = client_wave_size
+        self.client_wave_size = client_wave_size or spec.clients
         self.tbo_first_layer = tbo_first_layer
         if not self.capture_batches or self.capture_batches[-1] > max_batch_per_client:
             raise ValueError("invalid IAAS capture batches")
         if self.two_batch_overlap and any(batch % 2 for batch in self.capture_batches):
             raise ValueError("IAAS TBO currently requires even capture batches")
-        if self.client_wave_size not in (1, 2, IAAS_CLIENTS):
-            raise ValueError("IAAS client wave size must be 1, 2, or 4")
-        if not 0 <= self.tbo_first_layer <= IAAS_LAYERS:
+        if not 1 <= self.client_wave_size <= spec.clients:
+            raise ValueError(
+                f"IAAS client wave size must be in 1..{spec.clients}"
+            )
+        if spec.clients % self.client_wave_size:
+            raise ValueError("IAAS client wave size must divide client count")
+        if not 0 <= self.tbo_first_layer <= spec.layers:
             raise ValueError("invalid IAAS TBO first-layer boundary")
         self.group = StatelessProcessGroup.create(
-            host, port, 0, IAAS_WORLD_SIZE
+            host, port, 0, spec.world_size
         )
         self.group.store.set_timeout(timedelta(hours=1))
         self.comm = PyNcclCommunicator(self.group, device)
@@ -341,18 +452,22 @@ class IAASService:
 
         pages_per_req = (context_len + IAAS_PAGE_SIZE - 1) // IAAS_PAGE_SIZE
         self.pages_per_req = pages_per_req
-        self.total_rows = IAAS_CLIENTS * max_batch_per_client
+        self.total_rows = spec.clients * max_batch_per_client
         self.total_pages = self.total_rows * pages_per_req
         self.caches = [
             torch.zeros(
-                (self.total_pages, IAAS_PAGE_SIZE * 68),
+                (
+                    self.total_pages,
+                    IAAS_PAGE_SIZE * spec.cache_bytes_per_token,
+                ),
                 dtype=torch.uint8,
                 device=device,
             )
-            for _ in range(IAAS_LAYERS)
+            for _ in range(spec.layers)
         ]
-        for cache in self.caches:
-            cache[:, IAAS_PAGE_SIZE * 64 :].fill_(127)
+        if spec.cache_dtype == "fp4":
+            for cache in self.caches:
+                cache[:, IAAS_PAGE_SIZE * 64 :].fill_(127)
         self.full_block_table = torch.arange(
             self.total_pages, dtype=torch.int32, device=device
         ).view(self.total_rows, pages_per_req)
@@ -382,9 +497,13 @@ class IAASService:
                 batch,
                 request_offset=request_offset,
                 first_client=first_client,
-                num_clients=min(self.client_wave_size, IAAS_CLIENTS - first_client),
+                num_clients=min(
+                    self.client_wave_size, self.spec.clients - first_client
+                ),
             )
-            for first_client in range(0, IAAS_CLIENTS, self.client_wave_size)
+            for first_client in range(
+                0, self.spec.clients, self.client_wave_size
+            )
         )
 
     def _make_buffers(
@@ -420,32 +539,44 @@ class IAASService:
         loc = block_table[:, -1] * IAAS_PAGE_SIZE + (
             self.context_len - 1
         ) % IAAS_PAGE_SIZE
+        loc = loc.to(torch.int64)
         request_mailbox = None
         aggregate_request = None
+        data_dtype = (
+            torch.int8
+            if self.spec.cache_dtype == "fp4"
+            else torch.float8_e4m3fn
+        )
+        scale_dtype = (
+            torch.int32 if self.spec.cache_dtype == "fp4" else torch.float32
+        )
         if self.fused_request_mailbox:
             request_mailbox = torch.empty(
-                (num_clients, batch * IAAS_REQUEST_BYTES_PER_ROW),
+                (num_clients, batch * self.spec.request_bytes_per_row),
                 dtype=torch.uint8,
                 device=self.device,
             )
             aggregate_request = torch.empty(
-                rows * IAAS_REQUEST_BYTES_PER_ROW,
+                rows * self.spec.request_bytes_per_row,
                 dtype=torch.uint8,
                 device=self.device,
             )
-            q_bytes = rows * IAAS_Q_DATA_BYTES_PER_ROW
-            q_scale_bytes = rows * IAAS_Q_SCALE_BYTES_PER_ROW
-            weights_bytes = rows * IAAS_WEIGHTS_BYTES_PER_ROW
-            k_bytes = rows * IAAS_K_DATA_BYTES_PER_ROW
-            q_data = aggregate_request[:q_bytes].view(torch.int8).view(
-                rows, 1, IAAS_HEADS, IAAS_HEAD_DIM // 2
+            q_bytes = rows * self.spec.q_data_bytes_per_row
+            q_scale_bytes = rows * self.spec.q_scale_bytes_per_row
+            weights_bytes = rows * self.spec.weights_bytes_per_row
+            k_bytes = rows * self.spec.k_data_bytes_per_row
+            q_data = aggregate_request[:q_bytes].view(data_dtype).view(
+                rows,
+                1,
+                self.spec.heads,
+                self.spec.q_data_bytes_per_row // self.spec.heads,
             )
             q_scale = aggregate_request[
                 q_bytes : q_bytes + q_scale_bytes
-            ].view(torch.int32).view(rows, 1, IAAS_HEADS)
+            ].view(scale_dtype).view(rows, 1, self.spec.heads)
             weights = aggregate_request[
                 q_bytes + q_scale_bytes : q_bytes + q_scale_bytes + weights_bytes
-            ].view(torch.float32).view(rows, IAAS_HEADS)
+            ].view(torch.float32).view(rows, self.spec.heads)
             k_data = aggregate_request[
                 q_bytes
                 + q_scale_bytes
@@ -453,26 +584,51 @@ class IAASService:
                 + q_scale_bytes
                 + weights_bytes
                 + k_bytes
-            ].view(torch.int8).view(rows, IAAS_HEAD_DIM // 2)
-            k_scale = aggregate_request[-rows * IAAS_K_SCALE_BYTES_PER_ROW :].view(
-                torch.int32
+            ].view(data_dtype).view(rows, self.spec.k_data_bytes_per_row)
+            k_scale = aggregate_request[
+                -rows * self.spec.k_scale_bytes_per_row :
+            ].view(
+                scale_dtype
             )
         else:
             q_data = torch.empty(
-                (rows, 1, IAAS_HEADS, IAAS_HEAD_DIM // 2),
-                dtype=torch.int8,
+                (
+                    rows,
+                    1,
+                    self.spec.heads,
+                    self.spec.q_data_bytes_per_row // self.spec.heads,
+                ),
+                dtype=data_dtype,
                 device=self.device,
             )
             q_scale = torch.empty(
-                (rows, 1, IAAS_HEADS), dtype=torch.int32, device=self.device
+                (rows, 1, self.spec.heads),
+                dtype=scale_dtype,
+                device=self.device,
             )
             weights = torch.empty(
-                (rows, IAAS_HEADS), dtype=torch.float32, device=self.device
+                (rows, self.spec.heads),
+                dtype=torch.float32,
+                device=self.device,
             )
             k_data = torch.empty(
-                (rows, IAAS_HEAD_DIM // 2), dtype=torch.int8, device=self.device
+                (rows, self.spec.k_data_bytes_per_row),
+                dtype=data_dtype,
+                device=self.device,
             )
-            k_scale = torch.empty((rows,), dtype=torch.int32, device=self.device)
+            k_scale = torch.empty(
+                (rows,), dtype=scale_dtype, device=self.device
+            )
+
+        k_row = (
+            torch.empty(
+                (rows, self.spec.cache_bytes_per_token),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            if self.spec.cache_dtype == "fp8"
+            else None
+        )
 
         return _ServiceBuffers(
             batch_per_client=batch,
@@ -483,8 +639,9 @@ class IAASService:
             weights=weights,
             k_data=k_data,
             k_scale=k_scale,
+            k_row=k_row,
             responses=torch.empty(
-                (rows, IAAS_TOPK), dtype=torch.int32, device=self.device
+                (rows, self.spec.topk), dtype=torch.int32, device=self.device
             ),
             seqlens_2d=seqlens_2d,
             lengths=lengths,
@@ -504,19 +661,21 @@ class IAASService:
             peer = buffers.first_client + local_client + 1
             self.comm.recv(buffers.request_mailbox[local_client], src=peer)
         self.comm.group_end()
-        total_bytes = buffers.num_clients * batch * IAAS_REQUEST_BYTES_PER_ROW
+        total_bytes = (
+            buffers.num_clients * batch * self.spec.request_bytes_per_row
+        )
         _unpack_fused_requests_kernel[(triton.cdiv(total_bytes, 256),)](
             buffers.request_mailbox,
             buffers.aggregate_request,
             batch=batch,
-            per_client_bytes=batch * IAAS_REQUEST_BYTES_PER_ROW,
+            per_client_bytes=batch * self.spec.request_bytes_per_row,
             total_bytes=total_bytes,
             clients=buffers.num_clients,
-            q_bytes_per_row=IAAS_Q_DATA_BYTES_PER_ROW,
-            q_scale_bytes_per_row=IAAS_Q_SCALE_BYTES_PER_ROW,
-            weights_bytes_per_row=IAAS_WEIGHTS_BYTES_PER_ROW,
-            k_bytes_per_row=IAAS_K_DATA_BYTES_PER_ROW,
-            k_scale_bytes_per_row=IAAS_K_SCALE_BYTES_PER_ROW,
+            q_bytes_per_row=self.spec.q_data_bytes_per_row,
+            q_scale_bytes_per_row=self.spec.q_scale_bytes_per_row,
+            weights_bytes_per_row=self.spec.weights_bytes_per_row,
+            k_bytes_per_row=self.spec.k_data_bytes_per_row,
+            k_scale_bytes_per_row=self.spec.k_scale_bytes_per_row,
             BLOCK=256,
         )
 
@@ -580,27 +739,54 @@ class IAASService:
                     buffers.num_clients,
                 )
             cache = self.caches[layer]
-            _store_fp4_index_k_cache_kernel[(rows,)](
-                buffers.k_data.view(torch.uint8),
-                buffers.k_scale,
-                cache,
-                buffers.loc,
-                IAAS_PAGE_SIZE,
-                cache.stride(0),
-                BLOCK=64,
-            )
-            logits = deep_gemm.fp8_fp4_paged_mqa_logits(
-                (buffers.q_data, buffers.q_scale),
-                cache.view(self.total_pages, IAAS_PAGE_SIZE, 1, 68),
-                buffers.weights,
-                buffers.seqlens_2d,
-                buffers.block_table,
-                buffers.schedule,
-                self.context_len,
-                False,
-            )
+            if self.spec.cache_dtype == "fp4":
+                _store_fp4_index_k_cache_kernel[(rows,)](
+                    buffers.k_data.view(torch.uint8),
+                    buffers.k_scale,
+                    cache,
+                    buffers.loc,
+                    IAAS_PAGE_SIZE,
+                    cache.stride(0),
+                    BLOCK=64,
+                )
+                logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+                    (buffers.q_data, buffers.q_scale),
+                    cache.view(self.total_pages, IAAS_PAGE_SIZE, 1, 68),
+                    buffers.weights,
+                    buffers.seqlens_2d,
+                    buffers.block_table,
+                    buffers.schedule,
+                    self.context_len,
+                    False,
+                )
+            else:
+                assert buffers.k_row is not None
+                buffers.k_row[:, : self.spec.head_dim].view(
+                    torch.float8_e4m3fn
+                ).copy_(buffers.k_data)
+                buffers.k_row[:, self.spec.head_dim :].view(
+                    torch.float32
+                ).copy_(buffers.k_scale.view(rows, 1))
+                cache.view(-1, self.spec.cache_bytes_per_token).index_copy_(
+                    0, buffers.loc, buffers.k_row
+                )
+                logits = deep_gemm.fp8_paged_mqa_logits(
+                    buffers.q_data,
+                    cache.view(
+                        self.total_pages,
+                        IAAS_PAGE_SIZE,
+                        1,
+                        self.spec.cache_bytes_per_token,
+                    ),
+                    buffers.weights,
+                    buffers.seqlens_2d,
+                    buffers.block_table,
+                    buffers.schedule,
+                    self.context_len,
+                    False,
+                )
             buffers.responses.copy_(
-                fast_topk_v2(logits, buffers.lengths, IAAS_TOPK)
+                fast_topk_v2(logits, buffers.lengths, self.spec.topk)
             )
             self._send_to_clients(
                 buffers.responses,
@@ -614,7 +800,7 @@ class IAASService:
     ) -> None:
         full_phase = point_buffers[0]
         child_phases = point_buffers[1:]
-        for layer in range(IAAS_LAYERS):
+        for layer in range(self.spec.layers):
             if not child_phases or layer < self.tbo_first_layer:
                 phases = (full_phase,)
             else:
@@ -692,13 +878,22 @@ class IAASService:
             "capture_batches": list(self.capture_batches),
             "max_batch_per_client": self.max_batch_per_client,
             "context_len": self.context_len,
-            "layers": IAAS_LAYERS,
+            "clients": self.spec.clients,
+            "heads": self.spec.heads,
+            "head_dim": self.spec.head_dim,
+            "topk": self.spec.topk,
+            "layers": self.spec.layers,
+            "cache_dtype": self.spec.cache_dtype,
             "fused_request_mailbox": self.fused_request_mailbox,
             "two_batch_overlap": self.two_batch_overlap,
             "client_wave_size": self.client_wave_size,
             "tbo_first_layer": self.tbo_first_layer,
-            "fp4_cache_gib": (
-                IAAS_LAYERS * self.total_rows * self.context_len * 68 / 2**30
+            "index_cache_gib": (
+                self.spec.layers
+                * self.total_rows
+                * self.context_len
+                * self.spec.cache_bytes_per_token
+                / 2**30
             ),
             "torch_allocated_gib": torch.cuda.memory_allocated(self.device) / 2**30,
             "torch_reserved_gib": torch.cuda.memory_reserved(self.device) / 2**30,
@@ -710,12 +905,12 @@ class IAASService:
         }
 
     def shutdown(self) -> None:
-        for peer in range(1, IAAS_WORLD_SIZE):
+        for peer in range(1, self.spec.world_size):
             if self.group.recv_obj(src=peer) != "done":
                 raise RuntimeError(f"IAAS client {peer} invalid shutdown ready")
-        for peer in range(1, IAAS_WORLD_SIZE):
+        for peer in range(1, self.spec.world_size):
             self.group.send_obj("ack", dst=peer)
-        for peer in range(1, IAAS_WORLD_SIZE):
+        for peer in range(1, self.spec.world_size):
             if self.group.recv_obj(src=peer) != "exit_ready":
                 raise RuntimeError(f"IAAS client {peer} invalid exit confirmation")
 
@@ -731,13 +926,27 @@ def run_iaas_service(
     warmup_steps: int,
     decode_steps: int,
     result_filename: str,
+    clients: int = IAAS_DEFAULT_CLIENTS,
+    heads: int = IAAS_DEFAULT_HEADS,
+    head_dim: int = IAAS_DEFAULT_HEAD_DIM,
+    topk: int = IAAS_DEFAULT_TOPK,
+    layers: int = IAAS_DEFAULT_LAYERS,
+    cache_dtype: str = "fp4",
     fused_request_mailbox: bool = False,
     two_batch_overlap: bool = False,
-    client_wave_size: int = IAAS_CLIENTS,
+    client_wave_size: Optional[int] = None,
     decode_point_batches: Optional[Sequence[int]] = None,
 ) -> None:
     torch.cuda.set_device(gpu_id)
     device = torch.device("cuda", gpu_id)
+    spec = IAASSpec(
+        clients=clients,
+        heads=heads,
+        head_dim=head_dim,
+        topk=topk,
+        layers=layers,
+        cache_dtype=cache_dtype,
+    )
     service = IAASService(
         host=host,
         port=port,
@@ -745,6 +954,7 @@ def run_iaas_service(
         max_batch_per_client=max_batch_per_client,
         context_len=context_len,
         capture_batches=capture_batches,
+        spec=spec,
         fused_request_mailbox=fused_request_mailbox,
         two_batch_overlap=two_batch_overlap,
         client_wave_size=client_wave_size,

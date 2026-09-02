@@ -53,6 +53,7 @@ MODES = (
     "oracle_no_index",
     "oracle_recent",
     "iaas_fp4",
+    "iaas_fp8",
 )
 
 
@@ -73,13 +74,20 @@ class DummyDecodeArgs:
     synthetic_overlap_fraction: float = -1.0
     synthetic_overlap_fractions: str = ""
     record_retrieval_misses: bool = False
+    benchmark_host_to_device_ratio: int = 0
     iaas_host: str = "127.0.0.1"
     iaas_port: int = 29649
     iaas_service_gpu_id: int = 4
     iaas_service_device: str = ""
+    iaas_service_devices: str = ""
+    iaas_service_count: int = 1
     iaas_service_result_filename: str = "iaas_service.json"
     iaas_fused_request_mailbox: bool = False
     iaas_service_client_wave_size: int = 4
+    iaas_heads: int = 64
+    iaas_head_dim: int = 128
+    iaas_topk: int = 2048
+    iaas_layers: int = 61
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -122,6 +130,15 @@ class DummyDecodeArgs:
                 "store per layer/request and is intended for locality sweeps."
             ),
         )
+        parser.add_argument(
+            "--benchmark-host-to-device-ratio",
+            type=int,
+            default=0,
+            help=(
+                "Force a static HiSparse host_to_device_ratio for R sweeps. "
+                "Zero derives the minimum ratio from context/hot allocation."
+            ),
+        )
         parser.add_argument("--iaas-host", default="127.0.0.1")
         parser.add_argument("--iaas-port", type=int, default=29649)
         parser.add_argument("--iaas-service-gpu-id", type=int, default=4)
@@ -129,6 +146,17 @@ class DummyDecodeArgs:
             "--iaas-service-device",
             default="",
             help="Optional CUDA_VISIBLE_DEVICES value for the service child.",
+        )
+        parser.add_argument(
+            "--iaas-service-devices",
+            default="",
+            help=(
+                "Comma-separated CUDA_VISIBLE_DEVICES values, one per IAAS "
+                "service. Overrides --iaas-service-device."
+            ),
+        )
+        parser.add_argument(
+            "--iaas-service-count", type=int, choices=(1, 2), default=1
         )
         parser.add_argument(
             "--iaas-service-result-filename", default="iaas_service.json"
@@ -149,6 +177,10 @@ class DummyDecodeArgs:
                 "returning responses. Smaller waves expose cross-DP overlap."
             ),
         )
+        parser.add_argument("--iaas-heads", type=int, default=64)
+        parser.add_argument("--iaas-head-dim", type=int, default=128)
+        parser.add_argument("--iaas-topk", type=int, default=2048)
+        parser.add_argument("--iaas-layers", type=int, default=61)
         parser.add_argument(
             "--no-force-synthetic-retrieval",
             action="store_false",
@@ -201,19 +233,32 @@ def _configure_cli_for_point(
     page_size = args.page_size or 64
     assert page_size == 64, "DeepSeek-V3.2 DSA benchmark requires page_size=64"
     assert bench_args.device_buffer_size >= 2048
+    if bench_args.benchmark_host_to_device_ratio < 0:
+        raise ValueError("benchmark host_to_device_ratio must be non-negative")
 
     padded_hot = bench_args.device_buffer_size + page_size
-    device_tokens = _ceil_to(bench_args.batch_size * padded_hot, page_size)
+    hot_device_tokens = _ceil_to(
+        bench_args.batch_size * padded_hot, page_size
+    )
     aligned_context = _ceil_to(bench_args.context_len, page_size)
     private_index_pages = bench_args.indexer_mode not in (
         "oracle_no_index",
         "oracle_recent",
         "iaas_fp4",
+        "iaas_fp8",
     )
     logical_tokens = aligned_context * (
         bench_args.batch_size if private_index_pages else 1
     )
-    ratio = max(1, math.ceil(logical_tokens / device_tokens))
+    if bench_args.benchmark_host_to_device_ratio > 0:
+        ratio = bench_args.benchmark_host_to_device_ratio
+        logical_device_tokens = _ceil_to(
+            math.ceil(logical_tokens / ratio), page_size
+        )
+        device_tokens = max(hot_device_tokens, logical_device_tokens)
+    else:
+        device_tokens = hot_device_tokens
+        ratio = max(1, math.ceil(logical_tokens / device_tokens))
 
     # ModelRunner sizes the physical MLA pool from max_total_tokens. HiSparse
     # multiplies it by ratio for logical/index capacity.  Oracle shares the
@@ -262,10 +307,14 @@ def _configure_cli_for_point(
     return {
         "page_size": page_size,
         "padded_hot_tokens_per_request": padded_hot,
+        "requested_hot_device_tokens": hot_device_tokens,
         "device_pool_tokens": device_tokens,
         "logical_pool_tokens": device_tokens * ratio,
         "requested_logical_tokens": logical_tokens,
         "host_to_device_ratio": ratio,
+        "forced_host_to_device_ratio": (
+            bench_args.benchmark_host_to_device_ratio or None
+        ),
         "node_max_running_requests": args.max_running_requests,
         "allocation_batch_size_per_dp_rank": bench_args.batch_size,
         "active_batch_sizes_per_dp_rank": bench_args.active_batch_sizes(),
@@ -339,6 +388,7 @@ def _prepare_dummy_state(model_runner, bench_args: DummyDecodeArgs):
         "oracle_no_index",
         "oracle_recent",
         "iaas_fp4",
+        "iaas_fp8",
     )
     alloc_tokens = aligned_context * (bench_args.batch_size if private_pages else 1)
     logical = logical_allocator.alloc(alloc_tokens)
@@ -443,6 +493,7 @@ def _memory_breakdown(
     model_runner,
     bench_args: DummyDecodeArgs,
     actual_batch_size: int,
+    active_req_pool_indices: torch.Tensor,
 ) -> Dict[str, int]:
     pool = model_runner.token_to_kv_pool
     allocator = model_runner.token_to_kv_pool_allocator
@@ -452,6 +503,21 @@ def _memory_breakdown(
     weights = _tensor_bytes(list(model.parameters()) + list(model.buffers()))
     mla_device = _tensor_bytes(pool.kv_buffer)
     index_cache = _tensor_bytes(pool.index_k_with_scale_buffer)
+    kv_layers = len(pool.kv_buffer)
+    kv_bytes_per_layer_token = (
+        mla_device // (kv_layers * pool.size) if kv_layers and pool.size else 0
+    )
+    hot_state = coord.req_device_buffer_tokens.index_select(
+        1, active_req_pool_indices.to(torch.long)
+    )
+    observed_hot_layer_tokens = int((hot_state >= 0).sum().item())
+    index_layers = sum(
+        int(tensor.numel() > 0) for tensor in pool.index_k_with_scale_buffer
+    )
+    index_bytes_per_layer_token = (
+        pool.index_head_dim
+        + pool.index_head_dim // pool.quant_block_size * 4
+    )
     req_to_token = req_pool_bytes = model_runner.req_to_token_pool.req_to_token.nbytes
     allocator_mapping = _tensor_bytes(
         [allocator.full_to_hisparse_device_index_mapping]
@@ -495,7 +561,28 @@ def _memory_breakdown(
     return {
         "weights_and_model_buffers": weights,
         "mla_device_hot_pool": mla_device,
+        "hot_kv_quota_bytes": mla_device,
+        "hot_kv_active_request_capacity_bytes": (
+            actual_batch_size
+            * bench_args.device_buffer_size
+            * kv_layers
+            * kv_bytes_per_layer_token
+        ),
+        "hot_kv_observed_resident_bytes": (
+            observed_hot_layer_tokens * kv_bytes_per_layer_token
+        ),
+        "hot_kv_observed_layer_tokens": observed_hot_layer_tokens,
+        "hot_kv_bytes_per_layer_token": kv_bytes_per_layer_token,
         "indexer_k_scale_cache": index_cache,
+        "indexer_quota_bytes": index_cache,
+        "indexer_logically_occupied_bytes": (
+            actual_batch_size
+            * bench_args.context_len
+            * index_layers
+            * index_bytes_per_layer_token
+        ),
+        "indexer_bytes_per_layer_token": index_bytes_per_layer_token,
+        "indexer_storage_layer_count": index_layers,
         "req_to_token_map": req_pool_bytes,
         "logical_to_device_map": allocator_mapping,
         "coordinator_request_maps": coordinator_request_maps,
@@ -513,7 +600,7 @@ def _memory_breakdown(
         "active_logical_tokens": (
             bench_args.context_len
             if bench_args.indexer_mode
-            in ("oracle_no_index", "oracle_recent", "iaas_fp4")
+            in ("oracle_no_index", "oracle_recent", "iaas_fp4", "iaas_fp8")
             else actual_batch_size * bench_args.context_len
         ),
         "context_len": bench_args.context_len,
@@ -564,17 +651,27 @@ def _worker(
     initialize_fp4_gemm_config(server_args)
     initialize_bf16_gemm_config(server_args)
     iaas_client = None
-    if bench_args.indexer_mode == "iaas_fp4":
+    if bench_args.indexer_mode in ("iaas_fp4", "iaas_fp8"):
         from sglang.srt.layers.attention.dsa.iaas_indexer_service import (
             init_iaas_client,
         )
 
         torch.cuda.set_device(gpu_id)
+        clients_per_service = server_args.tp_size // bench_args.iaas_service_count
+        service_index = tp_rank // clients_per_service
         iaas_client = init_iaas_client(
             host=bench_args.iaas_host,
-            port=bench_args.iaas_port,
-            rank=tp_rank + 1,
+            port=bench_args.iaas_port + service_index,
+            rank=tp_rank % clients_per_service + 1,
             device=torch.device("cuda", gpu_id),
+            clients=clients_per_service,
+            heads=bench_args.iaas_heads,
+            head_dim=bench_args.iaas_head_dim,
+            topk=bench_args.iaas_topk,
+            layers=bench_args.iaas_layers,
+            cache_dtype=(
+                "fp4" if bench_args.indexer_mode == "iaas_fp4" else "fp8"
+            ),
             fused_request_mailbox=bench_args.iaas_fused_request_mailbox,
         )
     resolved_moe_backend = get_exec().moe.moe_runner_backend
@@ -684,7 +781,10 @@ def _worker(
             iaas_response_valid = bool(valid_flag.item())
 
         breakdown = _memory_breakdown(
-            model_runner, bench_args, actual_batch_size
+            model_runner,
+            bench_args,
+            actual_batch_size,
+            batch.req_pool_indices,
         )
         all_breakdowns: List[Dict[str, Any]] = [None] * server_args.tp_size
         if dist.is_initialized():
@@ -787,6 +887,25 @@ def _worker(
                     if iaas_client is not None
                     else None
                 ),
+                "iaas_service_count": (
+                    bench_args.iaas_service_count
+                    if iaas_client is not None
+                    else None
+                ),
+                "iaas_service_clients_per_gpu": (
+                    server_args.tp_size // bench_args.iaas_service_count
+                    if iaas_client is not None
+                    else None
+                ),
+                "iaas_index_cache_dtype": (
+                    (
+                        "fp4"
+                        if bench_args.indexer_mode == "iaas_fp4"
+                        else "fp8"
+                    )
+                    if iaas_client is not None
+                    else None
+                ),
                 "real_hisparse_io": True,
                 "real_sparse_attention": True,
                 "real_moe": True,
@@ -810,61 +929,94 @@ def main(
     port_args = PortArgs.init_new(server_args)
 
     workers = []
-    service_proc = None
     device_offset = 0
-    if bench_args.indexer_mode == "iaas_fp4":
+    if bench_args.indexer_mode in ("iaas_fp4", "iaas_fp8"):
         from sglang.srt.layers.attention.dsa.iaas_indexer_service import (
             run_iaas_service,
         )
 
         if server_args.tp_size != 4 or server_args.dp_size != 4:
-            raise ValueError("iaas_fp4 currently requires TP=4 and DP=4")
+            raise ValueError("IAAS currently requires TP=4 and DP=4")
+        if server_args.tp_size % bench_args.iaas_service_count:
+            raise ValueError("IAAS service count must divide TP size")
         if bench_args.force_synthetic_retrieval:
             raise ValueError(
-                "iaas_fp4 must use --no-force-synthetic-retrieval so the "
+                "IAAS must use --no-force-synthetic-retrieval so the "
                 "service top-k is not mislabeled as synthetic"
             )
+        visible_services = [
+            value.strip()
+            for value in bench_args.iaas_service_devices.split(",")
+            if value.strip()
+        ]
+        if not visible_services and bench_args.iaas_service_device:
+            visible_services = [bench_args.iaas_service_device]
+        if visible_services and len(visible_services) != bench_args.iaas_service_count:
+            raise ValueError(
+                "--iaas-service-devices must provide one device per service"
+            )
+        clients_per_service = server_args.tp_size // bench_args.iaas_service_count
+        result_path = Path(bench_args.iaas_service_result_filename)
         original_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if bench_args.iaas_service_device:
-            os.environ["CUDA_VISIBLE_DEVICES"] = bench_args.iaas_service_device
-            service_device_context = maybe_reindex_device_id(0)
-        else:
-            service_device_context = maybe_reindex_device_id(
-                bench_args.iaas_service_gpu_id
+        for service_index in range(bench_args.iaas_service_count):
+            if visible_services:
+                os.environ["CUDA_VISIBLE_DEVICES"] = visible_services[service_index]
+                service_device_context = maybe_reindex_device_id(0)
+            else:
+                service_device_context = maybe_reindex_device_id(
+                    bench_args.iaas_service_gpu_id + service_index
+                )
+            service_result = (
+                result_path
+                if bench_args.iaas_service_count == 1
+                else result_path.with_name(
+                    f"{result_path.stem}.service{service_index}{result_path.suffix}"
+                )
             )
-        with service_device_context as service_gpu_id:
-            service_proc = multiprocessing.Process(
-                target=run_iaas_service,
-                kwargs={
-                    "host": bench_args.iaas_host,
-                    "port": bench_args.iaas_port,
-                    "gpu_id": service_gpu_id,
-                    "max_batch_per_client": bench_args.batch_size,
-                    "capture_batches": bench_args.active_batch_sizes(),
-                    "context_len": bench_args.context_len,
-                    "warmup_steps": bench_args.warmup_steps,
-                    "decode_steps": bench_args.decode_steps,
-                    "result_filename": bench_args.iaas_service_result_filename,
-                    "fused_request_mailbox": (
-                        bench_args.iaas_fused_request_mailbox
-                    ),
-                    "two_batch_overlap": server_args.enable_two_batch_overlap,
-                    "client_wave_size": (
-                        bench_args.iaas_service_client_wave_size
-                    ),
-                    "decode_point_batches": [
-                        batch
-                        for batch in bench_args.active_batch_sizes()
-                        for _ in bench_args.overlap_fractions()
-                    ],
-                },
-            )
-            service_proc.start()
+            with service_device_context as service_gpu_id:
+                service_proc = multiprocessing.Process(
+                    target=run_iaas_service,
+                    kwargs={
+                        "host": bench_args.iaas_host,
+                        "port": bench_args.iaas_port + service_index,
+                        "gpu_id": service_gpu_id,
+                        "max_batch_per_client": bench_args.batch_size,
+                        "capture_batches": bench_args.active_batch_sizes(),
+                        "context_len": bench_args.context_len,
+                        "warmup_steps": bench_args.warmup_steps,
+                        "decode_steps": bench_args.decode_steps,
+                        "result_filename": str(service_result),
+                        "clients": clients_per_service,
+                        "heads": bench_args.iaas_heads,
+                        "head_dim": bench_args.iaas_head_dim,
+                        "topk": bench_args.iaas_topk,
+                        "layers": bench_args.iaas_layers,
+                        "cache_dtype": (
+                            "fp4"
+                            if bench_args.indexer_mode == "iaas_fp4"
+                            else "fp8"
+                        ),
+                        "fused_request_mailbox": (
+                            bench_args.iaas_fused_request_mailbox
+                        ),
+                        "two_batch_overlap": server_args.enable_two_batch_overlap,
+                        "client_wave_size": min(
+                            bench_args.iaas_service_client_wave_size,
+                            clients_per_service,
+                        ),
+                        "decode_point_batches": [
+                            batch
+                            for batch in bench_args.active_batch_sizes()
+                            for _ in bench_args.overlap_fractions()
+                        ],
+                    },
+                )
+                service_proc.start()
+            workers.append(service_proc)
         if original_visible_devices is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         else:
             os.environ["CUDA_VISIBLE_DEVICES"] = original_visible_devices
-        workers.append(service_proc)
 
     for tp_rank in range(server_args.tp_size):
         with maybe_reindex_device_id(tp_rank + device_offset) as gpu_id:

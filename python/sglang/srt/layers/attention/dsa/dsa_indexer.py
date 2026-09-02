@@ -1918,14 +1918,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             "oracle_no_index",
             "oracle_recent",
             "iaas_fp4",
+            "iaas_fp8",
         ):
             raise ValueError(
                 "SGLANG_DSA_BENCHMARK_MODE must be normal, "
                 "no_indexer_compute, oracle_no_index, oracle_recent, or "
-                "iaas_fp4; got "
+                "iaas_fp4, or iaas_fp8; got "
                 f"{benchmark_mode!r}"
             )
-        if benchmark_mode not in ("normal", "iaas_fp4"):
+        if benchmark_mode not in ("normal", "iaas_fp4", "iaas_fp8"):
             if not forward_batch.forward_mode.is_decode_or_idle():
                 raise RuntimeError(
                     f"{benchmark_mode} is decode-only and cannot run "
@@ -1938,16 +1939,33 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     forward_batch, device=x_meta.device
                 )
             else:
-                topk_result = self._synthetic_decode_topk(
-                    forward_batch, device=x_meta.device, layer_id=layer_id
+                overlap_fraction = float(
+                    os.environ.get(
+                        "SGLANG_DSA_BENCHMARK_OVERLAP_FRACTION", "-1"
+                    )
                 )
+                if overlap_fraction >= 0:
+                    # The no-index oracle must consume the same controlled
+                    # retrieval trace as normal/IAAS.  Previously this early
+                    # return always used the legacy pressure pattern, while the
+                    # result metadata still reported the requested overlap.
+                    topk_result = self._synthetic_overlap_decode_topk(
+                        forward_batch,
+                        device=x_meta.device,
+                        layer_id=layer_id,
+                        overlap_fraction=overlap_fraction,
+                    )
+                else:
+                    topk_result = self._synthetic_decode_topk(
+                        forward_batch, device=x_meta.device, layer_id=layer_id
+                    )
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
-        if benchmark_mode == "iaas_fp4":
+        if benchmark_mode in ("iaas_fp4", "iaas_fp8"):
             if not forward_batch.forward_mode.is_decode_or_idle():
                 raise RuntimeError(
-                    "iaas_fp4 currently supports decode/idle only, got "
+                    "IAAS currently supports decode/idle only, got "
                     f"{forward_batch.forward_mode}"
                 )
             # Model initialization runs eager decode-shaped dummy forwards for

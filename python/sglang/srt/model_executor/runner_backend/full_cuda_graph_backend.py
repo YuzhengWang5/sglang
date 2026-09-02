@@ -101,7 +101,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         # its eager warmups and local graph capture phase-aligned with the four
         # model workers. Dense DSA variants do not call the remote indexer.
         iaas_client = None
-        if envs.SGLANG_DSA_BENCHMARK_MODE.get() == "iaas_fp4":
+        if envs.SGLANG_DSA_BENCHMARK_MODE.get() in ("iaas_fp4", "iaas_fp8"):
             from sglang.srt.layers.attention.dsa.iaas_indexer_service import (
                 get_iaas_client_if_initialized,
             )

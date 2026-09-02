@@ -4432,7 +4432,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_key_cache = (
             None
             if envs.SGLANG_DSA_BENCHMARK_MODE.get()
-            in ("oracle_no_index", "oracle_recent", "iaas_fp4")
+            in ("oracle_no_index", "oracle_recent", "iaas_fp4", "iaas_fp8")
             else self._create_index_key_cache()
         )
         self._finalize_allocation_log(size)
